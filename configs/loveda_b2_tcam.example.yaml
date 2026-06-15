@@ -1,0 +1,59 @@
+# HA-LoRA B2 + TCAM example config for LoveDA.
+# Copy this file and edit local paths before training.
+
+data_root: ./datasets/LoveDA
+checkpoint_dir: ./checkpoints
+output_dir: ./outputs/loveda_b2_tcam
+
+backbone:
+  name: vitl16
+  checkpoint: ./checkpoints/modelscope_dinov3_vitl16_lvd1689m/model.safetensors
+
+input_norm: imagenet
+
+lora:
+  mode: ssd
+  rank_config: progressive
+  target_modules: [qkv, fc1, fc2]
+  semantic_only: false
+  alpha_init: 1.0
+  structural_path_type: tcam_cov
+  tcam_base_path: multi_scale_dwconv
+  tcam_blocks: [1, 2, 3, 4, 5, 6, 7, 8]
+  tcam_gamma: 0.2
+  tcam_hidden_min: 8
+
+layers_to_extract: [3, 6, 9, 12, 18, 24]
+patch_size: 16
+
+decoder:
+  type: mlp
+  embed_dim: 256
+
+ema:
+  enabled: true
+  decay: 0.9995
+  start_step: 1000
+
+dataset_type: loveda
+num_classes: 7
+image_size: 512
+batch_size: 4
+grad_accum_steps: 1
+grad_clip_norm: 10.0
+epochs: 100
+lr: 1.5e-4
+weight_decay: 0.05
+warmup_iters: 1000
+scheduler: cosine
+dice_weight: 1.0
+
+hflip: true
+vflip: true
+rotation: true
+resize_scale: [0.5, 2.0]
+
+seed: 42
+num_workers: 8
+fp16: true
+gpu_ids: [0]

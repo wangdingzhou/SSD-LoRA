@@ -1,0 +1,81 @@
+# Python / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local IDE / agent state
+.vscode/
+.idea/
+.aris/
+.claude/
+CLAUDE.md
+
+# Secrets / local config
+.env
+.env.*
+*.key
+*.pem
+
+# Datasets and external assets
+dataset/
+datasets/
+data/
+local_papers/
+Reference Code/
+dinov3/
+
+# Model weights and checkpoints
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+
+# Training outputs, logs, and experiment artifacts
+logs/
+outputs/
+experiments/
+results_from_autodl/
+results_from_gpu_server/
+runs/
+wandb/
+*.log
+events.out.tfevents*
+
+# Project research records / private notes
+refine-logs/
+MEMORY.md
+PROJECT_STATUS.md
+WORK_LOG.md
+cross_dataset/CONFIG_INDEX.md
+cross_dataset/CROSS_DATASET_PLAN.md
+
+# Historical/local experiment configs with absolute machine paths.
+# Use configs/*.example.yaml for public, portable examples.
+src/config*.yaml
+cross_dataset/config_*.yaml
+
+# Remote monitoring / queue scripts for private machines
+scripts/monitor_*.sh
+scripts/post_*.sh
+scripts/queue_*.sh
+scripts/phase3_cron_supervise.sh
+cross_dataset/run_potsdam_all.sh
+
+# Generated visualizations / temporary files
+vis/
+tmp/
+temp/
+*.tmp
+*.bak
+*.bak_*
