@@ -962,6 +962,104 @@ class SpatialReliabilityGate(nn.Module):
         return gate
 
 
+class ParallelSemanticStructuralFuse(nn.Module):
+    """Parallel semantic-structural fuse with bounded residual.
+
+    Pipeline:
+      sem = sem_proj(U)                       # semantic stream
+      str = str_local_mix(str_proj(S))        # structural stream (refined)
+      coeff = softmax(Conv([sem, str, ent, margin, local_unc])) over {sem, str}
+      gate = SpatialReliabilityGate(...)
+      out = U + lambda * gate * (coeff_sem*sem + coeff_str*str - U)
+
+    Mathematical guarantee: gate in [0,1], coeff_sem + coeff_str = 1 (softmax),
+    lambda >= 0 => output in bounded neighborhood of U.
+    At lambda=0 init => out = U exactly (identity).
+
+    Args:
+        channels: shared channel dim for sem/str/U (e.g., 384).
+        guide_channels: structural input channels (e.g., 192).
+        lambda_init: residual scale init (default 0.0 for identity-at-start).
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        guide_channels: int,
+        lambda_init: float = 0.0,
+    ):
+        super().__init__()
+        self.channels = channels
+
+        self.sem_proj = nn.Sequential(
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.GroupNorm(min(32, channels), channels),
+            nn.GELU(),
+        )
+        self.str_proj = nn.Sequential(
+            nn.Conv2d(guide_channels, channels, 1, bias=False),
+            nn.GroupNorm(min(32, channels), channels),
+            nn.GELU(),
+        )
+        self.str_local_mix = nn.Sequential(
+            nn.Conv2d(channels, channels, 5, padding=2, groups=channels, bias=False),
+            nn.GroupNorm(min(32, channels), channels),
+            nn.GELU(),
+        )
+
+        # Coefficient mapper: input [sem, str, ent, margin, local_unc] -> {sem, str}
+        self.coeff_conv = nn.Conv2d(channels * 2 + 3, 2, 1)
+        nn.init.zeros_(self.coeff_conv.weight)
+        nn.init.zeros_(self.coeff_conv.bias)  # softmax([0,0]) = [0.5, 0.5]
+
+        self.gate = SpatialReliabilityGate(
+            sem_channels=channels, str_channels=channels, init_bias=0.0
+        )
+
+        # Learnable residual scale, init=0 for identity at start
+        self.lam = nn.Parameter(torch.tensor(lambda_init))
+
+    def forward(
+        self,
+        U: torch.Tensor,
+        S: torch.Tensor,
+        entropy: torch.Tensor,
+        margin: torch.Tensor,
+    ):
+        """
+        Args:
+            U: (B, C, H, W) semantic reconstruction (from MultiBasisLAR).
+            S: (B, Cg, H, W) structural prior.
+            entropy: (B, 1, H, W).
+            margin: (B, 1, H, W).
+        Returns:
+            out: (B, C, H, W) bounded residual fusion.
+            diag: dict with gate_mean, coeff_sem_mean, coeff_str_mean, lambda.
+        """
+        sem = self.sem_proj(U)
+        str_raw = self.str_proj(S)
+        str_feat = self.str_local_mix(str_raw)
+
+        local_unc = _avg_pool_2d(entropy, k=5)
+        coeff_input = torch.cat([sem, str_feat, entropy, margin, local_unc], dim=1)
+        coeff = torch.softmax(self.coeff_conv(coeff_input), dim=1)
+        coeff_sem = coeff[:, 0:1]
+        coeff_str = coeff[:, 1:2]
+
+        gate = self.gate(sem, str_feat, entropy, margin)
+
+        mixed = coeff_sem * sem + coeff_str * str_feat
+        out = U + self.lam * gate * (mixed - U)
+
+        diag = {
+            "gate_mean": gate.mean().detach(),
+            "coeff_sem_mean": coeff_sem.mean().detach(),
+            "coeff_str_mean": coeff_str.mean().detach(),
+            "lambda": self.lam.detach(),
+        }
+        return out, diag
+
+
 # ---------------------------------------------------------------------------
 # Decoders
 # ---------------------------------------------------------------------------
