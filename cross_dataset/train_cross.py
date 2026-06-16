@@ -425,13 +425,62 @@ def train(cfg):
                     l_ce = m2f_loss_dict.get("loss_ce", torch.tensor(0.0))
                     l_dice = m2f_loss_dict.get("loss_dice", torch.tensor(0.0))
                 else:
-                    # Standard decoders (PFU, MLP, UPerNet)
+                    # Standard decoders (PFU, MLP, UPerNet, SC-CMRD-LAR)
                     logits = output
+                    aux_outputs = None
                     if isinstance(logits, dict):
+                        aux_outputs = logits
                         logits = logits["logits"]
                     l_ce = ce_loss_fn(logits, masks)
                     l_dice = dice_loss_fn(logits, masks)
                     loss = l_ce + dice_weight * l_dice
+
+                    # Native-scale aux supervision (SC-CMRD-LAR)
+                    if aux_outputs is not None and "aux_logits8" in aux_outputs:
+                        aux_weight = cfg.get("decoder", {}).get(
+                            "sc_cmrd_lar", {}
+                        ).get("aux_weight", 0.4)
+                        for key in ("aux_logits8", "aux_logits4", "aux_logits16"):
+                            aux_logits = aux_outputs[key]
+                            aux_logits_up = torch.nn.functional.interpolate(
+                                aux_logits, size=masks.shape[-2:],
+                                mode="bilinear", align_corners=False,
+                            )
+                            l_aux_ce = ce_loss_fn(aux_logits_up, masks)
+                            l_aux_dice = dice_loss_fn(aux_logits_up, masks)
+                            loss = loss + aux_weight * (l_aux_ce + dice_weight * l_aux_dice)
+
+                    # Affinity preservation loss (SC-CMRD-LAR)
+                    if (
+                        aux_outputs is not None
+                        and "affinity_model" in aux_outputs
+                        and "affinity_anchor" in aux_outputs
+                    ):
+                        aff_cfg = cfg.get("decoder", {}).get(
+                            "sc_cmrd_lar", {}
+                        ).get("affinity_loss", {})
+                        aff_enabled = aff_cfg.get("enabled", False)
+                        aff_warmup_start = aff_cfg.get("warmup_start_epoch", 5)
+                        aff_warmup_end = aff_cfg.get("warmup_end_epoch", 15)
+                        aff_target_weight = aff_cfg.get("weight", 0.01)
+                        if aff_enabled and epoch >= aff_warmup_start:
+                            if epoch < aff_warmup_end:
+                                progress = (epoch - aff_warmup_start) / max(1, aff_warmup_end - aff_warmup_start)
+                                aff_weight = aff_target_weight * progress
+                            else:
+                                aff_weight = aff_target_weight
+                            if aff_weight > 0:
+                                if not hasattr(model, "_affinity_loss_fn"):
+                                    from model import AffinityPreservationLoss
+                                    model._affinity_loss_fn = AffinityPreservationLoss(
+                                        n_anchor_tokens=aff_cfg.get("n_anchor_tokens", 196),
+                                        tau=aff_cfg.get("tau", 0.2),
+                                    )
+                                l_aff = model._affinity_loss_fn(
+                                    aux_outputs["affinity_model"],
+                                    aux_outputs["affinity_anchor"],
+                                )
+                                loss = loss + aff_weight * l_aff
 
                     # Boundary loss (gradients flow back to main model)
                     if boundary_loss_fn is not None:
