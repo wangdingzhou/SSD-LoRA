@@ -2617,6 +2617,22 @@ class HALoRASeg(nn.Module):
                 dec_layers=m2f_cfg.get("dec_layers", 9),
                 dim_feedforward=m2f_cfg.get("dim_feedforward", 2048),
             )
+        elif decoder_type == "sc_cmrd_lar":
+            sc_cfg = decoder_cfg.get("sc_cmrd_lar", {})
+            self.decoder = SCCMRDLarDecoder(
+                in_channels=self.embed_dim,
+                embed_dim=decoder_embed_dim,
+                guide_channels=sc_cfg.get("guide_channels", 192),
+                num_classes=num_classes,
+                hr_n_blocks=sc_cfg.get("hr_n_blocks", 1),
+                refine_n_blocks=sc_cfg.get("refine_n_blocks", 2),
+                n_layers=len(self.layers_to_extract),
+            )
+            print(
+                f"SC-CMRD-LAR/v1.2 decoder: embed_dim={decoder_embed_dim}, "
+                f"guide_channels={sc_cfg.get('guide_channels', 192)}, "
+                f"n_layers={len(self.layers_to_extract)}"
+            )
         else:
             raise ValueError(f"Unknown decoder type: {decoder_type}")
 
@@ -2887,7 +2903,11 @@ class HALoRASeg(nn.Module):
                 if l0 in self._sp_inject_layers_0idx:
                     feature_maps[i] = self.spatial_injector(feature_maps[i], s8)
 
-        out = self.decoder(feature_maps, img_size=(H, W))
+        # SCCMRDLarDecoder requires RGB; other decoders ignore via type check.
+        if isinstance(self.decoder, SCCMRDLarDecoder):
+            out = self.decoder(feature_maps, img_size=(H, W), rgb=x)
+        else:
+            out = self.decoder(feature_maps, img_size=(H, W))
         if self.sru_plugin is not None and isinstance(out, torch.Tensor):
             shallow = feature_maps[:self._sru_n_shallow]
             out = self.sru_plugin(out, shallow)
