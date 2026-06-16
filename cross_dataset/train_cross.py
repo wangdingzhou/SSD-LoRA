@@ -624,8 +624,12 @@ def train(cfg):
                         bp8 = aux_outputs["basis_probs_for_loss"].get("schrr_8")
                         bp4 = aux_outputs["basis_probs_for_loss"].get("schrr_4")
                         if bp8 is not None and bp4 is not None:
-                            H8 = -(bp8 * torch.log(bp8 + 1e-12)).sum(dim=1).mean()
-                            H4 = -(bp4 * torch.log(bp4 + 1e-12)).sum(dim=1).mean()
+                            # fp32 + clamp_min: AMP softmax can produce exact 0 in fp16,
+                            # causing NaN in 0*log(0). Cast to fp32 and clamp >= 1e-6.
+                            bp8f = bp8.float().clamp_min(1e-6)
+                            bp4f = bp4.float().clamp_min(1e-6)
+                            H8 = -(bp8f * torch.log(bp8f)).sum(dim=1).mean()
+                            H4 = -(bp4f * torch.log(bp4f)).sum(dim=1).mean()
                             H = 0.5 * (H8 + H4)  # average over scales, don't double beta
                             loss = loss - beta * H  # maximize entropy
                             step_diag["ent_beta"] = beta
@@ -654,8 +658,10 @@ def train(cfg):
                                 usage = bp.mean(dim=(0, 2, 3)).tolist()
                                 for b_idx, u in enumerate(usage):
                                     step_diag[f"b{b_idx}_{scale_tag}"] = u
+                                # fp32 + clamp_min: same numerical safety as entropy reg above.
+                                bpf = bp.float().clamp_min(1e-6)
                                 ent = -(
-                                    bp * torch.log(bp.clamp(min=1e-12))
+                                    bpf * torch.log(bpf)
                                 ).sum(dim=1).mean().item()
                                 step_diag[f"ent_{scale_tag}"] = ent
 
