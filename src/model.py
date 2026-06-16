@@ -508,6 +508,81 @@ class FeatureFusionModule(nn.Module):
         return self.fuse(fused)
 
 
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt-style residual block: DWConv7x7 + PW expand 4x + GELU + PW reduce + LayerScale + residual.
+
+    Used by SpatialPriorModule to refine the from-scratch spatial prior.
+    LayerScale init=1e-6 keeps the block near-identity at start so the SPM
+    starts by behaving like a plain stem.
+    """
+
+    def __init__(self, dim: int, layer_scale_init: float = 1e-6, dropout: float = 0.0):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, 7, padding=3, groups=dim)
+        self.norm = nn.GroupNorm(num_groups=min(32, dim), num_channels=dim)
+        self.pwconv1 = nn.Linear(dim, 4 * dim)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(4 * dim, dim)
+        self.gamma = nn.Parameter(torch.full((dim,), layer_scale_init)) if layer_scale_init > 0 else None
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = x.permute(0, 2, 3, 1)          # (B, H, W, C) for Linear
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = self.gamma * x
+        x = x.permute(0, 3, 1, 2)          # back to (B, C, H, W)
+        x = self.drop(x)
+        return identity + x
+
+
+class SpatialPriorModule(nn.Module):
+    """From-scratch CNN stem that extracts a spatial prior S8 from input RGB.
+
+    Output is at H/8 resolution with `out_channels` channels. Designed to be
+    used as the K/V source for SpatialPriorInjector (cross-attention into
+    frozen DINOv3 H/16 features).
+
+    Architecture:
+        stem: 3 x (Conv3x3 stride2 + GroupNorm + GELU), 3 -> 32 -> 64 -> out_channels
+        refine: n_blocks x ConvNeXtBlock(out_channels)
+
+    At 512x512 input, output is (B, out_channels, 64, 64).
+    """
+
+    def __init__(self, out_channels: int = 128, n_blocks: int = 2, dropout: float = 0.0):
+        super().__init__()
+        # 3 stride-2 convs: 512 -> 256 -> 128 -> 64
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(num_groups=8, num_channels=32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(num_groups=16, num_channels=64),
+            nn.GELU(),
+            nn.Conv2d(64, out_channels, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(num_groups=min(32, out_channels), num_channels=out_channels),
+            nn.GELU(),
+        )
+        self.blocks = nn.Sequential(
+            *[ConvNeXtBlock(out_channels, dropout=dropout) for _ in range(n_blocks)]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, 3, H, W) normalized RGB (ImageNet stats).
+        Returns:
+            S8: (B, out_channels, H/8, W/8).
+        """
+        return self.blocks(self.stem(x))
+
+
 # ---------------------------------------------------------------------------
 # Decoders
 # ---------------------------------------------------------------------------
