@@ -858,6 +858,54 @@ class MultiBasisLocalAttenderUpsample(nn.Module):
         return U, diag
 
 
+class HREvidenceEncoder(nn.Module):
+    """Multi-resolution RGB structural prior encoder (SC-CMRD-LAR/v1.2).
+
+    Produces {S8 @ H/8, S4 @ H/4} from RGB. Each scale has its own small CNN
+    stem followed by 1 ConvNeXtBlock for refinement.
+
+    Args:
+        out_channels: channel dim of each output scale (default 192).
+        n_blocks: ConvNeXtBlocks per scale after stem (default 1).
+    """
+
+    def __init__(self, out_channels: int = 192, n_blocks: int = 1):
+        super().__init__()
+        self.s8_stem = nn.Sequential(
+            nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(8, 32), nn.GELU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(16, 64), nn.GELU(),
+            nn.Conv2d(64, out_channels, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(min(32, out_channels), out_channels), nn.GELU(),
+        )
+        self.s8_refine = nn.Sequential(
+            *[ConvNeXtBlock(out_channels) for _ in range(n_blocks)]
+        )
+
+        self.s4_stem = nn.Sequential(
+            nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(8, 32), nn.GELU(),
+            nn.Conv2d(32, out_channels, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(min(32, out_channels), out_channels), nn.GELU(),
+        )
+        self.s4_refine = nn.Sequential(
+            *[ConvNeXtBlock(out_channels) for _ in range(n_blocks)]
+        )
+
+    def forward(self, rgb: torch.Tensor):
+        """
+        Args:
+            rgb: (B, 3, H, W) ImageNet-normalized.
+        Returns:
+            S8: (B, out_channels, H/8, W/8)
+            S4: (B, out_channels, H/4, W/4)
+        """
+        S8 = self.s8_refine(self.s8_stem(rgb))
+        S4 = self.s4_refine(self.s4_stem(rgb))
+        return S8, S4
+
+
 # ---------------------------------------------------------------------------
 # Decoders
 # ---------------------------------------------------------------------------
