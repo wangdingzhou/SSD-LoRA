@@ -419,6 +419,9 @@ def train(cfg):
             with torch.amp.autocast("cuda", enabled=use_amp):
                 output = model(images)
 
+                # Per-step diagnostics (populated for SC-CMRD-LAR; empty for others)
+                step_diag = {}
+
                 if is_m2f and m2f_criterion is not None:
                     # Mask2Former: use set prediction loss
                     loss, m2f_loss_dict = compute_m2f_loss(m2f_criterion, output, masks, num_classes)
@@ -449,6 +452,9 @@ def train(cfg):
                             l_aux_ce = ce_loss_fn(aux_logits_up, masks)
                             l_aux_dice = dice_loss_fn(aux_logits_up, masks)
                             loss = loss + aux_weight * (l_aux_ce + dice_weight * l_aux_dice)
+                            scale_tag = key.replace("aux_logits", "")
+                            step_diag[f"aux_ce_{scale_tag}"] = l_aux_ce.item()
+                            step_diag[f"aux_dice_{scale_tag}"] = l_aux_dice.item()
 
                     # Affinity preservation loss (SC-CMRD-LAR)
                     if (
@@ -463,6 +469,8 @@ def train(cfg):
                         aff_warmup_start = aff_cfg.get("warmup_start_epoch", 5)
                         aff_warmup_end = aff_cfg.get("warmup_end_epoch", 15)
                         aff_target_weight = aff_cfg.get("weight", 0.01)
+                        aff_weight = 0.0
+                        l_aff_val = 0.0
                         if aff_enabled and epoch >= aff_warmup_start:
                             if epoch < aff_warmup_end:
                                 progress = (epoch - aff_warmup_start) / max(1, aff_warmup_end - aff_warmup_start)
@@ -481,6 +489,37 @@ def train(cfg):
                                     aux_outputs["affinity_anchor"],
                                 )
                                 loss = loss + aff_weight * l_aff
+                                l_aff_val = l_aff.item()
+                        step_diag["aff_w"] = aff_weight
+                        step_diag["aff_l"] = l_aff_val
+
+                    # Extract per-block model diagnostics (gate, coeff, lambda,
+                    # basis usage, router entropy) from aux_outputs["diag"].
+                    if aux_outputs is not None and "diag" in aux_outputs:
+                        model_diag = aux_outputs["diag"]
+                        for scale_key, scale_tag in [("schrr_8", "8"), ("schrr_4", "4")]:
+                            d = model_diag.get(scale_key, {})
+                            step_diag[f"gate_{scale_tag}"] = d.get(
+                                "gate_mean", torch.tensor(float("nan"))
+                            ).item()
+                            step_diag[f"csem_{scale_tag}"] = d.get(
+                                "coeff_sem_mean", torch.tensor(float("nan"))
+                            ).item()
+                            step_diag[f"cstr_{scale_tag}"] = d.get(
+                                "coeff_str_mean", torch.tensor(float("nan"))
+                            ).item()
+                            step_diag[f"lam_{scale_tag}"] = d.get(
+                                "lambda", torch.tensor(float("nan"))
+                            ).item()
+                            bp = d.get("basis_probs")
+                            if bp is not None:
+                                usage = bp.mean(dim=(0, 2, 3)).tolist()
+                                for b_idx, u in enumerate(usage):
+                                    step_diag[f"b{b_idx}_{scale_tag}"] = u
+                                ent = -(
+                                    bp * torch.log(bp.clamp(min=1e-12))
+                                ).sum(dim=1).mean().item()
+                                step_diag[f"ent_{scale_tag}"] = ent
 
                     # Boundary loss (gradients flow back to main model)
                     if boundary_loss_fn is not None:
@@ -516,6 +555,34 @@ def train(cfg):
                 bnd_str = f" Bnd: {l_boundary.item():.4f}" if boundary_loss_fn is not None else ""
                 print(f"Epoch [{epoch+1}/{epochs}] Batch [{batch_idx}/{len(train_loader)}] "
                       f"Loss: {loss.item() * grad_accum_steps:.4f} (CE: {l_ce.item():.4f} Dice: {l_dice.item():.4f}{bnd_str}) LR: {lr_now:.6f}")
+                # Compact SC-CMRD-LAR diagnostics: per-scale gate/coeff/lambda/basis/aux/aff
+                if step_diag:
+                    parts = []
+                    for scale_tag in ("8", "4"):
+                        if f"gate_{scale_tag}" in step_diag:
+                            parts.append(
+                                f"S{scale_tag}[g={step_diag[f'gate_{scale_tag}']:.3f},"
+                                f"cs={step_diag[f'csem_{scale_tag}']:.3f},"
+                                f"ct={step_diag[f'cstr_{scale_tag}']:.3f},"
+                                f"l={step_diag[f'lam_{scale_tag}']:.3f},"
+                                f"b=({step_diag.get(f'b0_{scale_tag}', 0):.2f},"
+                                f"{step_diag.get(f'b1_{scale_tag}', 0):.2f},"
+                                f"{step_diag.get(f'b2_{scale_tag}', 0):.2f}),"
+                                f"e={step_diag.get(f'ent_{scale_tag}', 0):.3f},"
+                                f"ax={step_diag.get(f'aux_ce_{scale_tag}', 0):.3f}]"
+                            )
+                    if "16" in str(step_diag.get("aux_ce_16", "")) or "aux_ce_16" in step_diag:
+                        parts.append(f"Ax16={step_diag.get('aux_ce_16', 0):.3f}")
+                    if "aff_w" in step_diag:
+                        parts.append(f"Aff[w={step_diag['aff_w']:.4f},l={step_diag['aff_l']:.4f}]")
+                    print(f"  DIAG: " + " ".join(parts))
+
+            # TensorBoard per-step diagnostics (SC-CMRD-LAR only)
+            if step_diag and writer is not None:
+                for k, v in step_diag.items():
+                    if isinstance(v, float) and (v != v):  # NaN check
+                        continue
+                    writer.add_scalar(f"diag/{k}", v, global_step)
 
         dt = time.time() - t0
         avg_loss = epoch_loss / len(train_loader)
