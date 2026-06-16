@@ -1146,6 +1146,65 @@ class SCHRRBlock(nn.Module):
         return X_high, aux_logits, entropy, diag
 
 
+class AffinityPreservationLoss(nn.Module):
+    """Sampled affinity preservation loss (SC-CMRD-LAR/v1.2 section 4).
+
+    Computes self-similarity (affinity) matrices for both the model's
+    intermediate features (X8) and the frozen anchor (F16), then minimizes
+    their L1 distance. This prevents HR RGB evidence from drifting the
+    DINO semantic topology.
+
+    Affinity is computed at a fixed S*S spatial anchor grid via adaptive
+    avg pool. Channel-dim is L2-normalized before affinity. Train-only,
+    no inference cost.
+
+    Args:
+        n_anchor_tokens: total anchor tokens, must be a perfect square (e.g., 196=14*14).
+        tau: affinity softmax temperature (default 0.2).
+    """
+
+    def __init__(self, n_anchor_tokens: int = 196, tau: float = 0.2):
+        super().__init__()
+        self.n_anchor_tokens = n_anchor_tokens
+        side = int(n_anchor_tokens ** 0.5)
+        assert side * side == n_anchor_tokens, (
+            f"n_anchor_tokens must be perfect square, got {n_anchor_tokens}"
+        )
+        self.anchor_side = side
+        self.tau = tau
+
+    def _affinity(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute affinity matrix from (B, C, H, W) feature map.
+
+        Returns (B, N, N) where N = anchor_side**2.
+        """
+        pooled = torch.nn.functional.adaptive_avg_pool2d(
+            x, output_size=(self.anchor_side, self.anchor_side)
+        )
+        tokens = pooled.flatten(2).transpose(1, 2)             # (B, N, C)
+        tokens = torch.nn.functional.normalize(tokens, dim=-1)
+        aff = torch.matmul(tokens, tokens.transpose(1, 2)) / self.tau
+        aff = torch.softmax(aff, dim=-1)
+        return aff
+
+    def forward(
+        self,
+        x_model: torch.Tensor,
+        x_anchor: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x_model: (B, C_m, H, W) model feature (NOT detached).
+            x_anchor: (B, C_a, H, W) anchor (caller should pass detached).
+        Returns:
+            loss: scalar L1 distance between affinity matrices.
+        """
+        A_model = self._affinity(x_model)
+        with torch.no_grad():
+            A_anchor = self._affinity(x_anchor)
+        return torch.nn.functional.l1_loss(A_model, A_anchor)
+
+
 # ---------------------------------------------------------------------------
 # Decoders
 # ---------------------------------------------------------------------------
