@@ -906,6 +906,62 @@ class HREvidenceEncoder(nn.Module):
         return S8, S4
 
 
+def _avg_pool_2d(x: torch.Tensor, k: int) -> torch.Tensor:
+    """AvgPool2d with 'same' padding (k//2 on each side)."""
+    return torch.nn.functional.avg_pool2d(x, kernel_size=k, stride=1, padding=k // 2)
+
+
+class SpatialReliabilityGate(nn.Module):
+    """Spatial reliability gate (SC-CMRD-LAR/v1.2 section 3).
+
+    Inputs are 7 channels: [sem, str, entropy, margin, local_unc,
+    boundary_density, low_margin_density]. Output is a (B, 1, H, W) gate
+    in (0, 1).
+
+    Gate conv weight zero-init, bias init determines start gate (sigmoid(bias)).
+    Default bias=0 gives mean gate ~0.5 at start.
+
+    Args:
+        sem_channels: semantic stream channels.
+        str_channels: structural stream channels.
+        init_bias: gate conv bias init (default 0.0).
+    """
+
+    def __init__(self, sem_channels: int, str_channels: int, init_bias: float = 0.0):
+        super().__init__()
+        in_dim = sem_channels + str_channels + 5
+        self.gate_conv = nn.Conv2d(in_dim, 1, 1)
+        nn.init.zeros_(self.gate_conv.weight)
+        nn.init.constant_(self.gate_conv.bias, init_bias)
+
+    def forward(
+        self,
+        sem: torch.Tensor,
+        str_feat: torch.Tensor,
+        entropy: torch.Tensor,
+        margin: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            sem: (B, C_sem, H, W).
+            str_feat: (B, C_str, H, W).
+            entropy: (B, 1, H, W) softmax entropy H(P).
+            margin: (B, 1, H, W) top-1 minus top-2 probability.
+        Returns:
+            gate: (B, 1, H, W) in (0, 1).
+        """
+        local_unc = _avg_pool_2d(entropy, k=5)
+        boundary_density = _avg_pool_2d(entropy * (margin < 1e-3).float(), k=5)
+        low_margin_density = _avg_pool_2d(1.0 - margin, k=5)
+
+        gate_input = torch.cat([
+            sem, str_feat, entropy, margin,
+            local_unc, boundary_density, low_margin_density,
+        ], dim=1)
+        gate = torch.sigmoid(self.gate_conv(gate_input))
+        return gate
+
+
 # ---------------------------------------------------------------------------
 # Decoders
 # ---------------------------------------------------------------------------
