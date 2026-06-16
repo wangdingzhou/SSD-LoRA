@@ -1205,6 +1205,125 @@ class AffinityPreservationLoss(nn.Module):
         return torch.nn.functional.l1_loss(A_model, A_anchor)
 
 
+class SCCMRDLarDecoder(nn.Module):
+    """SC-CMRD-LAR/v1.2-refined decoder (unified SCHRR).
+
+    Pipeline:
+      1. Project 6 frozen DINO layers to embed_dim and sum -> F16_proj
+      2. HR encoder: RGB -> {S8 @ H/8, S4 @ H/4}
+      3. SCHRR_8: F16_proj + S8 -> X8 @ H/8 (aux logits8)
+      4. SCHRR_4: X8 + S4 -> X4 @ H/4 (aux logits4)
+      5. Refine X4: n x ConvNeXtBlock
+      6. Head: refine(X4) -> logits4 -> bilinear -> logits at full res
+      7. Native aux head at F16_proj: logits16
+
+    Args:
+        in_channels: frozen DINO feature dim (1024 for ViT-L).
+        embed_dim: working channel dim (default 384).
+        guide_channels: HR encoder output channels per scale (default 192).
+        num_classes: 6 for Potsdam, 7 for LoveDA.
+        hr_n_blocks: ConvNeXt blocks in HR encoder per scale (default 1).
+        refine_n_blocks: ConvNeXt blocks after SCHRR_4 (default 2).
+        n_layers: number of DINO layers to fuse (default 6).
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1024,
+        embed_dim: int = 384,
+        guide_channels: int = 192,
+        num_classes: int = 6,
+        hr_n_blocks: int = 1,
+        refine_n_blocks: int = 2,
+        n_layers: int = 6,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_classes = num_classes
+
+        self.layer_projs = nn.ModuleList([
+            nn.Conv2d(in_channels, embed_dim, 1, bias=False)
+            for _ in range(n_layers)
+        ])
+
+        self.hr_encoder = HREvidenceEncoder(
+            out_channels=guide_channels, n_blocks=hr_n_blocks
+        )
+
+        self.schrr_8 = SCHRRBlock(
+            channels=embed_dim, guide_channels=guide_channels,
+            upsample_factor=2, num_classes=num_classes, aux_head=True,
+        )
+        self.schrr_4 = SCHRRBlock(
+            channels=embed_dim, guide_channels=guide_channels,
+            upsample_factor=2, num_classes=num_classes, aux_head=True,
+        )
+
+        self.refine = nn.Sequential(
+            *[ConvNeXtBlock(embed_dim) for _ in range(refine_n_blocks)]
+        )
+
+        self.head = nn.Conv2d(embed_dim, num_classes, 1)
+
+        self.aux_head_16 = nn.Conv2d(embed_dim, num_classes, 1)
+
+    def forward(
+        self,
+        features: list,
+        img_size: tuple,
+        rgb: torch.Tensor = None,
+    ):
+        """
+        Args:
+            features: list of n_layers tensors, each (B, in_channels, H/16, W/16).
+            img_size: (H, W) target output size.
+            rgb: (B, 3, H, W) original RGB. REQUIRED.
+        Returns:
+            dict with: logits, aux_logits8, aux_logits4, aux_logits16,
+                       affinity_model, affinity_anchor, diag.
+        """
+        if rgb is None:
+            raise ValueError("SCCMRDLarDecoder requires rgb input")
+        assert len(features) > 0
+        B, _, H16, W16 = features[0].shape
+        H, W = img_size
+
+        f16_proj = sum(
+            proj(feat) for proj, feat in zip(self.layer_projs, features)
+        )
+        f16_anchor = features[-1].detach()
+
+        S8, S4 = self.hr_encoder(rgb)
+
+        X8, aux8, ent8, diag8 = self.schrr_8(f16_proj, S8)
+        X4, aux4, ent4, diag4 = self.schrr_4(X8, S4)
+
+        X4_refined = self.refine(X4)
+        logits4 = self.head(X4_refined)
+        logits = torch.nn.functional.interpolate(
+            logits4, size=(H, W), mode="bilinear", align_corners=False
+        )
+
+        aux16 = self.aux_head_16(f16_proj)
+
+        diag = {
+            "schrr_8": diag8,
+            "schrr_4": diag4,
+            "f16_proj_mean": f16_proj.mean().detach(),
+            "f16_proj_std": f16_proj.std().detach(),
+        }
+
+        return {
+            "logits": logits,
+            "aux_logits8": aux8,
+            "aux_logits4": aux4,
+            "aux_logits16": aux16,
+            "affinity_model": X8,
+            "affinity_anchor": f16_anchor,
+            "diag": diag,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Decoders
 # ---------------------------------------------------------------------------
