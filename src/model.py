@@ -661,6 +661,204 @@ class SpatialPriorInjector(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# SC-CMRD-LAR/v1.2 components
+# ---------------------------------------------------------------------------
+
+def _shift_2d(v: torch.Tensor, dy: int, dx: int) -> torch.Tensor:
+    """Shift a (B, C, H, W) tensor by (dy, dx) with replicate padding.
+
+    Sign convention: positive dy shifts content down (output[y] = input[y-dy]).
+    Used by MultiBasisLocalAttenderUpsample to sample V at offset positions.
+    """
+    if dy == 0 and dx == 0:
+        return v
+    H, W = v.shape[-2:]
+    pad_top = max(dy, 0)
+    pad_bot = max(-dy, 0)
+    pad_left = max(dx, 0)
+    pad_right = max(-dx, 0)
+    v_padded = torch.nn.functional.pad(
+        v, (pad_left, pad_right, pad_top, pad_bot), mode="replicate"
+    )
+    y0 = max(-dy, 0)
+    x0 = max(-dx, 0)
+    return v_padded[..., y0:y0 + H, x0:x0 + W]
+
+
+# Fixed basis offsets in LOW-RES pixel units (applied to V_low via shift*factor).
+_BASIS_SQUARE3 = [
+    (-1, -1), (-1, 0), (-1, 1),
+    (0, -1), (0, 0), (0, 1),
+    (1, -1), (1, 0), (1, 1),
+]
+_BASIS_AXIAL_STRIP5 = [
+    (0, -2), (0, -1), (0, 0), (0, 1), (0, 2),
+    (-2, 0), (-1, 0), (1, 0), (2, 0),
+]
+_BASIS_RING8 = [
+    (-2, -2), (-2, 0), (-2, 2),
+    (0, -2), (0, 2),
+    (2, -2), (2, 0), (2, 2),
+]
+
+
+class _OffsetBasis(nn.Module):
+    """Holds a fixed set of (dy, dx) offsets for one basis.
+
+    Stores offsets in low-res units and exposes them scaled to high-res
+    via upsample_factor. The anchor positional code is a normalized
+    meshgrid in [-1, 1]; per-offset distinction is delegated to the
+    learned K_b-dim conv output.
+    """
+
+    def __init__(self, offsets: torch.Tensor, upsample_factor: int = 2):
+        super().__init__()
+        self.register_buffer("offsets_lowres", offsets)
+        self.upsample_factor = upsample_factor
+
+    @property
+    def offsets_highres(self) -> list:
+        return [
+            (int(dy * self.upsample_factor), int(dx * self.upsample_factor))
+            for dy, dx in self.offsets_lowres.tolist()
+        ]
+
+    def anchor_pos_code(self, H: int, W: int, device, dtype) -> torch.Tensor:
+        """Return (1, 2, H, W) positional code: normalized meshgrid in [-1, 1]."""
+        ys = torch.linspace(-1, 1, H, device=device, dtype=dtype)
+        xs = torch.linspace(-1, 1, W, device=device, dtype=dtype)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        return torch.stack([grid_y, grid_x], dim=0).unsqueeze(0)
+
+
+class MultiBasisLocalAttenderUpsample(nn.Module):
+    """Multi-basis local attender upsample (SC-CMRD-LAR/v1.2 section 1).
+
+    For each target (high-res) pixel p:
+      1. router(pi_b) = softmax_b over bases, conditioned on [query, guide]
+      2. per basis: attn_{b,k} = softmax_k over offsets, conditioned on
+         [query, guide, positional_code]
+      3. U(p) = sum_b pi_b(p) * sum_k attn_{b,k}(p) * V_low_upsampled(p + 2*offset)
+
+    V_low is bilinearly upsampled to high-res first, then shifts are applied
+    at high-res using offset*upsample_factor. This keeps all attention weight
+    computation at high resolution while ensuring the span of the output is
+    contained in span(V_low_upsampled) (bilinear is linear, preserves span).
+
+    Args:
+        in_channels: V_low channel dim (e.g., 384 after projection).
+        query_channels: Query_high channel dim (e.g., 384).
+        guide_channels: Guide_high (RGB structural prior) channel dim (e.g., 192).
+        out_channels: output channel dim (typically = in_channels for cascade).
+        upsample_factor: typically 2 (e.g., H/16 -> H/8).
+        hidden_dim: internal projection dim for router/attn convs (default 256).
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        query_channels: int,
+        guide_channels: int,
+        out_channels: int,
+        upsample_factor: int = 2,
+        hidden_dim: int = 256,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.upsample_factor = upsample_factor
+
+        bases = {
+            "square3": _BASIS_SQUARE3,
+            "axial_strip5": _BASIS_AXIAL_STRIP5,
+            "ring8": _BASIS_RING8,
+        }
+        self.basis_names = list(bases.keys())
+        self.n_bases = len(self.basis_names)
+        self.basis_offsets = nn.ModuleList([
+            _OffsetBasis(torch.tensor(bases[name], dtype=torch.float32), upsample_factor)
+            for name in self.basis_names
+        ])
+
+        # Value projection: V_low -> hidden_dim
+        self.v_proj = nn.Conv2d(in_channels, hidden_dim, 1, bias=False)
+
+        # Router over bases
+        self.router_conv = nn.Conv2d(query_channels + guide_channels, self.n_bases, 1)
+
+        # Per-basis attention over offsets
+        self.attn_convs = nn.ModuleList([
+            nn.Conv2d(query_channels + guide_channels + 2, len(bases[name]), 1)
+            for name in self.basis_names
+        ])
+
+        # Output projection: hidden_dim -> out_channels. Zero-init for clean
+        # identity-at-start when composed with ParallelSemanticStructuralFuse
+        # at lambda=0.
+        self.out_proj = nn.Conv2d(hidden_dim, out_channels, 1)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(
+        self,
+        v_low: torch.Tensor,
+        query_high: torch.Tensor,
+        guide_high: torch.Tensor,
+    ):
+        """
+        Args:
+            v_low: (B, in_channels, H_low, W_low) e.g., (B, 384, 32, 32).
+            query_high: (B, query_channels, H_high, W_high) e.g., (B, 384, 64, 64).
+            guide_high: (B, guide_channels, H_high, W_high) e.g., (B, 192, 64, 64).
+        Returns:
+            U: (B, out_channels, H_high, W_high).
+            diag: dict with basis_probs (B, n_bases, H_high, W_high).
+        """
+        B, _, H_high, W_high = query_high.shape
+
+        v_proj = self.v_proj(v_low)
+        v_high = torch.nn.functional.interpolate(
+            v_proj, size=(H_high, W_high), mode="bilinear", align_corners=False
+        )
+
+        router_logits = self.router_conv(
+            torch.cat([query_high, guide_high], dim=1)
+        )
+        basis_probs = torch.softmax(router_logits, dim=1)
+
+        attended = torch.zeros(
+            B, self.v_proj.out_channels, H_high, W_high,
+            device=v_low.device, dtype=v_low.dtype,
+        )
+        for b_idx, (offset_basis, attn_conv) in enumerate(
+            zip(self.basis_offsets, self.attn_convs)
+        ):
+            pos_code = offset_basis.anchor_pos_code(
+                H_high, W_high, device=v_low.device, dtype=v_low.dtype
+            )
+            attn_logits = attn_conv(
+                torch.cat([
+                    query_high, guide_high,
+                    pos_code.expand(B, -1, -1, -1),
+                ], dim=1)
+            )
+            attn_weights = torch.softmax(attn_logits, dim=1)
+
+            K_b = attn_weights.shape[1]
+            attended_b = torch.zeros_like(attended)
+            for k_idx in range(K_b):
+                dy_high, dx_high = offset_basis.offsets_highres[k_idx]
+                v_shifted = _shift_2d(v_high, dy_high, dx_high)
+                attended_b = attended_b + attn_weights[:, k_idx:k_idx + 1] * v_shifted
+
+            attended = attended + basis_probs[:, b_idx:b_idx + 1] * attended_b
+
+        U = self.out_proj(attended)
+        diag = {"basis_probs": basis_probs.detach()}
+        return U, diag
+
+
+# ---------------------------------------------------------------------------
 # Decoders
 # ---------------------------------------------------------------------------
 
