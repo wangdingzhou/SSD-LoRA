@@ -1956,6 +1956,48 @@ class HALoRASeg(nn.Module):
         else:
             raise ValueError(f"Unknown decoder type: {decoder_type}")
 
+        # --- Optional Spatial Prior (P0 diagnostic) ---
+        # RGB -> S8 CNN stem + cross-attention injector into selected frozen
+        # feature maps. gamma=0 init keeps model at R0 behavior at start.
+        sp_cfg = decoder_cfg.get("spatial_prior", None)
+        if sp_cfg and sp_cfg.get("enabled", False):
+            inject_layers_1idx = sp_cfg.get("inject_layers", [18, 24])
+            self._sp_inject_layers_0idx = [l - 1 for l in inject_layers_1idx]
+            # Validate inject_layers against layers_to_extract
+            for l0 in self._sp_inject_layers_0idx:
+                if l0 not in self.layers_to_extract_0idx:
+                    raise ValueError(
+                        f"spatial_prior.inject_layers entry (1-idx={l0+1}) "
+                        f"is not in layers_to_extract {self.layers_to_extract}; "
+                        f"injection has no effect on that layer."
+                    )
+            d_spm = sp_cfg.get("spm_channels", 128)
+            d_bottleneck = sp_cfg.get("d_bottleneck", 256)
+            n_heads = sp_cfg.get("num_heads", 8)
+            spm_blocks = sp_cfg.get("spm_blocks", 2)
+            sp_dropout = sp_cfg.get("dropout", 0.0)
+            self.spatial_prior_enabled = True
+            self.spm = SpatialPriorModule(
+                out_channels=d_spm, n_blocks=spm_blocks, dropout=sp_dropout,
+            )
+            self.spatial_injector = SpatialPriorInjector(
+                d_frozen=self.embed_dim,
+                d_spm=d_spm,
+                d_bottleneck=d_bottleneck,
+                num_heads=n_heads,
+                dropout=sp_dropout,
+            )
+            print(
+                f"Spatial prior enabled: inject_layers={inject_layers_1idx}, "
+                f"spm_channels={d_spm}, d_bottleneck={d_bottleneck}, "
+                f"num_heads={n_heads}, spm_blocks={spm_blocks}"
+            )
+        else:
+            self.spatial_prior_enabled = False
+            self._sp_inject_layers_0idx = []
+            self.spm = None
+            self.spatial_injector = None
+
         # --- Optional SRU plugin (shallow ViT feature injection into logits) ---
         sru_cfg = decoder_cfg.get("sru_plugin", None)
         if sru_cfg and sru_cfg.get("enabled", False):
@@ -2169,6 +2211,17 @@ class HALoRASeg(nn.Module):
             # feat: (B, N_patches, C) — CLS and storage tokens already stripped
             feat = feat.reshape(B, h_patches, w_patches, -1).permute(0, 3, 1, 2).contiguous()
             feature_maps.append(feat)
+
+        # Spatial prior injection (P0 diagnostic): enrich selected frozen
+        # feature maps with S8 from a from-scratch CNN stem on RGB.
+        # gamma=0 init means feature_maps are unchanged at epoch 0 step 0,
+        # so the model starts exactly at R0 behavior and only diverges as
+        # gamma learns to grow.
+        if self.spatial_prior_enabled:
+            s8 = self.spm(x)
+            for i, l0 in enumerate(self.layers_to_extract_0idx):
+                if l0 in self._sp_inject_layers_0idx:
+                    feature_maps[i] = self.spatial_injector(feature_maps[i], s8)
 
         out = self.decoder(feature_maps, img_size=(H, W))
         if self.sru_plugin is not None and isinstance(out, torch.Tensor):
