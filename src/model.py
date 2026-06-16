@@ -1060,6 +1060,92 @@ class ParallelSemanticStructuralFuse(nn.Module):
         return out, diag
 
 
+class SCHRRBlock(nn.Module):
+    """Semantic-Constrained High-Resolution Reconstruction block.
+
+    Composes MultiBasisLocalAttenderUpsample + ParallelSemanticStructuralFuse.
+    Takes a low-res semantic feature V_low and high-res RGB guide S_high,
+    produces a high-res output X_high. Includes a native-scale aux head on
+    the LAR output U for uncertainty features (entropy, margin) and aux
+    supervision.
+
+    Args:
+        channels: shared channel dim (e.g., 384).
+        guide_channels: RGB structural prior channels at this scale (e.g., 192).
+        upsample_factor: typically 2.
+        num_classes: for aux head + uncertainty features.
+        aux_head: if True, include 1x1 head for aux logits at this scale.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        guide_channels: int,
+        upsample_factor: int = 2,
+        num_classes: int = 6,
+        aux_head: bool = True,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.aux_head = aux_head
+
+        self.q_proj = nn.Conv2d(guide_channels, channels, 1, bias=False)
+
+        self.lar = MultiBasisLocalAttenderUpsample(
+            in_channels=channels,
+            query_channels=channels,
+            guide_channels=guide_channels,
+            out_channels=channels,
+            upsample_factor=upsample_factor,
+        )
+
+        self.fuse = ParallelSemanticStructuralFuse(
+            channels=channels,
+            guide_channels=guide_channels,
+            lambda_init=0.0,
+        )
+
+        if aux_head:
+            self.aux_head_conv = nn.Conv2d(channels, num_classes, 1)
+
+    def forward(
+        self,
+        v_low: torch.Tensor,
+        guide_high: torch.Tensor,
+    ):
+        """
+        Args:
+            v_low: (B, C, H_low, W_low).
+            guide_high: (B, Cg, H_high, W_high).
+        Returns:
+            X_high: (B, C, H_high, W_high).
+            aux_logits: (B, num_classes, H_high, W_high) or None.
+            entropy: (B, 1, H_high, W_high) — softmax entropy of aux logits.
+            diag: merged dict from sub-modules.
+        """
+        B, _, H_high, W_high = guide_high.shape
+        query_high = self.q_proj(guide_high)
+
+        U, lar_diag = self.lar(v_low, query_high, guide_high)
+
+        if self.aux_head:
+            aux_logits = self.aux_head_conv(U)
+            probs = torch.softmax(aux_logits, dim=1)
+            log_probs = torch.log_softmax(aux_logits, dim=1)
+            entropy = -(probs * log_probs).sum(dim=1, keepdim=True)
+            top2 = torch.topk(probs, k=2, dim=1).values
+            margin = (top2[:, 0:1] - top2[:, 1:2]).clamp(min=0.0)
+        else:
+            aux_logits = None
+            entropy = torch.zeros(B, 1, H_high, W_high, device=v_low.device, dtype=v_low.dtype)
+            margin = torch.ones(B, 1, H_high, W_high, device=v_low.device, dtype=v_low.dtype)
+
+        X_high, fuse_diag = self.fuse(U, guide_high, entropy, margin)
+
+        diag = {**lar_diag, **fuse_diag}
+        return X_high, aux_logits, entropy, diag
+
+
 # ---------------------------------------------------------------------------
 # Decoders
 # ---------------------------------------------------------------------------
