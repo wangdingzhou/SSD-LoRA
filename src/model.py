@@ -767,6 +767,9 @@ class MultiBasisLocalAttenderUpsample(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.upsample_factor = upsample_factor
+        # v2: Router temperature for anti-collapse annealing. Default 1.0 (eval).
+        # Train loop sets this via decoder.set_router_temperature(τ(epoch)).
+        self.temperature = 1.0
 
         bases = {
             "square3": _BASIS_SQUARE3,
@@ -792,12 +795,11 @@ class MultiBasisLocalAttenderUpsample(nn.Module):
             for name in self.basis_names
         ])
 
-        # Output projection: hidden_dim -> out_channels. Zero-init for clean
-        # identity-at-start when composed with ParallelSemanticStructuralFuse
-        # at lambda=0.
+        # Output projection: hidden_dim -> out_channels. Default Kaiming init
+        # (NOT zero-init) so gradient flows back to v_proj/router/attn_convs
+        # from epoch 0. Identity-at-start is enforced at the fuse level
+        # (lambda=0 => out=U), not the block level.
         self.out_proj = nn.Conv2d(hidden_dim, out_channels, 1)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
 
     def forward(
         self,
@@ -824,7 +826,8 @@ class MultiBasisLocalAttenderUpsample(nn.Module):
         router_logits = self.router_conv(
             torch.cat([query_high, guide_high], dim=1)
         )
-        basis_probs = torch.softmax(router_logits, dim=1)
+        # v2: temperature-scaled softmax for anti-collapse. τ>1 smooths router.
+        basis_probs = torch.softmax(router_logits / self.temperature, dim=1)
 
         attended = torch.zeros(
             B, self.v_proj.out_channels, H_high, W_high,
@@ -854,7 +857,11 @@ class MultiBasisLocalAttenderUpsample(nn.Module):
             attended = attended + basis_probs[:, b_idx:b_idx + 1] * attended_b
 
         U = self.out_proj(attended)
-        diag = {"basis_probs": basis_probs.detach()}
+        diag = {
+            "basis_probs": basis_probs.detach(),  # for logging only
+            "basis_probs_for_loss": basis_probs,   # non-detached, for entropy reg
+            "temperature": self.temperature,
+        }
         return U, diag
 
 
@@ -972,24 +979,27 @@ class ParallelSemanticStructuralFuse(nn.Module):
       gate = SpatialReliabilityGate(...)
       out = U + lambda * gate * (coeff_sem*sem + coeff_str*str - U)
 
-    Mathematical guarantee: gate in [0,1], coeff_sem + coeff_str = 1 (softmax),
-    lambda >= 0 => output in bounded neighborhood of U.
-    At lambda=0 init => out = U exactly (identity).
+    Mathematical guarantee: gate in [0,1], λ = lambda_max*sigmoid(raw_lambda) ∈ (0, 0.3).
+    Let a = λ*gate ∈ [0, 0.3]. Then out = (1-a)*U + a*mixed, a bounded convex
+    combination of U and mixed (U always dominates, weight >= 0.7).
 
     Args:
         channels: shared channel dim for sem/str/U (e.g., 384).
         guide_channels: structural input channels (e.g., 192).
-        lambda_init: residual scale init (default 0.0 for identity-at-start).
+        lambda_max: upper bound on λ (default 0.3). raw_lambda init=-4 →
+                    sigmoid(-4)≈0.018 → λ≈0.005 (near identity but nonzero,
+                    so mixed/gate/coeff have gradient from step 0).
     """
 
     def __init__(
         self,
         channels: int,
         guide_channels: int,
-        lambda_init: float = 0.0,
+        lambda_max: float = 0.3,
     ):
         super().__init__()
         self.channels = channels
+        self.lambda_max = lambda_max
 
         self.sem_proj = nn.Sequential(
             nn.Conv2d(channels, channels, 1, bias=False),
@@ -1016,8 +1026,15 @@ class ParallelSemanticStructuralFuse(nn.Module):
             sem_channels=channels, str_channels=channels, init_bias=0.0
         )
 
-        # Learnable residual scale, init=0 for identity at start
-        self.lam = nn.Parameter(torch.tensor(lambda_init))
+        # Bounded residual scale: λ = lambda_max * sigmoid(raw_lambda) ∈ (0, lambda_max).
+        # raw_lambda=-4 init → sigmoid(-4)≈0.018 → λ≈0.005 (near identity but nonzero,
+        # so mixed/gate/coeff have gradient from step 0, avoiding fuse cold-start).
+        self.raw_lambda = nn.Parameter(torch.tensor(-4.0))
+
+    @property
+    def lam(self):
+        """Bounded λ ∈ (0, lambda_max). Use this everywhere instead of raw_lambda."""
+        return self.lambda_max * torch.sigmoid(self.raw_lambda)
 
     def forward(
         self,
@@ -1089,7 +1106,8 @@ class SCHRRBlock(nn.Module):
         self.channels = channels
         self.aux_head = aux_head
 
-        self.q_proj = nn.Conv2d(guide_channels, channels, 1, bias=False)
+        # v2: query from semantic v_low (not RGB guide). Input dim = channels.
+        self.q_proj = nn.Conv2d(channels, channels, 1, bias=False)
 
         self.lar = MultiBasisLocalAttenderUpsample(
             in_channels=channels,
@@ -1102,7 +1120,7 @@ class SCHRRBlock(nn.Module):
         self.fuse = ParallelSemanticStructuralFuse(
             channels=channels,
             guide_channels=guide_channels,
-            lambda_init=0.0,
+            lambda_max=0.3,
         )
 
         if aux_head:
@@ -1124,7 +1142,11 @@ class SCHRRBlock(nn.Module):
             diag: merged dict from sub-modules.
         """
         B, _, H_high, W_high = guide_high.shape
-        query_high = self.q_proj(guide_high)
+        # v2: semantic query from upsampled v_low (not RGB guide).
+        v_low_up = torch.nn.functional.interpolate(
+            v_low, size=(H_high, W_high), mode="bilinear", align_corners=False
+        )
+        query_high = self.q_proj(v_low_up)
 
         U, lar_diag = self.lar(v_low, query_high, guide_high)
 
@@ -1267,6 +1289,15 @@ class SCCMRDLarDecoder(nn.Module):
 
         self.aux_head_16 = nn.Conv2d(embed_dim, num_classes, 1)
 
+    def set_router_temperature(self, tau: float):
+        """Set router temperature for both SCHRR blocks (train + eval).
+
+        Call with τ=1.0 before eval/validation. EMA.module is a deep copy —
+        if eval uses ema.module, call set_router_temperature on it too.
+        """
+        self.schrr_8.lar.temperature = tau
+        self.schrr_4.lar.temperature = tau
+
     def forward(
         self,
         features: list,
@@ -1313,6 +1344,14 @@ class SCCMRDLarDecoder(nn.Module):
             "f16_proj_std": f16_proj.std().detach(),
         }
 
+        # Non-detached basis_probs for entropy reg loss (train only).
+        # diag8/diag4 come from MultiBasisLocalAttenderUpsample which returns
+        # basis_probs_for_loss (non-detached). These flow gradient to router_conv.
+        basis_probs_for_loss = {
+            "schrr_8": diag8.get("basis_probs_for_loss"),
+            "schrr_4": diag4.get("basis_probs_for_loss"),
+        }
+
         return {
             "logits": logits,
             "aux_logits8": aux8,
@@ -1321,6 +1360,7 @@ class SCCMRDLarDecoder(nn.Module):
             "affinity_model": X8,
             "affinity_anchor": f16_anchor,
             "diag": diag,
+            "basis_probs_for_loss": basis_probs_for_loss,
         }
 
 
