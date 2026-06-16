@@ -583,6 +583,83 @@ class SpatialPriorModule(nn.Module):
         return self.blocks(self.stem(x))
 
 
+class SpatialPriorInjector(nn.Module):
+    """Cross-attention injector: enrich frozen DINOv3 H/16 features with RGB spatial prior.
+
+    Q = projected frozen feature map (B, H/16*W/16, d_bottleneck)
+    K,V = projected S8 spatial prior (B, H/8*W/8, d_bottleneck)
+    Output = feature_map + gamma * project_back(MHA(Q, K, V))
+
+    gamma is a learnable scalar initialized to 0, so the module is exact
+    identity at init (model starts at R0 behavior). This is critical for
+    not breaking the frozen-backbone warm start.
+
+    Used in HALoRASeg.forward to inject S8 into selected backbone feature
+    maps before they enter the decoder.
+    """
+
+    def __init__(
+        self,
+        d_frozen: int = 1024,           # ViT-L embed_dim
+        d_spm: int = 128,               # SpatialPriorModule out_channels
+        d_bottleneck: int = 256,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.d_frozen = d_frozen
+        self.d_bottleneck = d_bottleneck
+
+        # Q/K/V projections into bottleneck space
+        self.q_proj = nn.Linear(d_frozen, d_bottleneck)
+        self.k_proj = nn.Linear(d_spm, d_bottleneck)
+        self.v_proj = nn.Linear(d_spm, d_bottleneck)
+
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_bottleneck,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm_q = nn.LayerNorm(d_bottleneck)
+        self.norm_out = nn.LayerNorm(d_bottleneck)
+        self.out_proj = nn.Linear(d_bottleneck, d_frozen)
+
+        # gamma=0 init => identity at start
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        feature_map: torch.Tensor,
+        s8: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            feature_map: (B, d_frozen, H/16, W/16) frozen DINOv3 feature.
+            s8:          (B, d_spm,    H/8,  W/8)  spatial prior from SPM.
+        Returns:
+            (B, d_frozen, H/16, W/16) enriched feature (identity at init).
+        """
+        B, C, Hf, Wf = feature_map.shape
+        # Flatten spatial dims: (B, H*W, C)
+        q = feature_map.flatten(2).transpose(1, 2)            # (B, Hf*Wf, d_frozen)
+        kv = s8.flatten(2).transpose(1, 2)                    # (B, H8*W8, d_spm)
+
+        q = self.q_proj(q)                                    # (B, Nq, d_bottleneck)
+        k = self.k_proj(kv)                                   # (B, Nk, d_bottleneck)
+        v = self.v_proj(kv)                                   # (B, Nk, d_bottleneck)
+        q = self.norm_q(q)
+
+        attn_out, _ = self.attn(q, k, v, need_weights=False)  # (B, Nq, d_bottleneck)
+        attn_out = self.norm_out(attn_out)
+        out = self.out_proj(attn_out)                         # (B, Nq, d_frozen)
+
+        # Reshape back to spatial: (B, d_frozen, Hf, Wf)
+        out = out.transpose(1, 2).reshape(B, C, Hf, Wf)
+
+        return feature_map + self.gamma * out
+
+
 # ---------------------------------------------------------------------------
 # Decoders
 # ---------------------------------------------------------------------------
