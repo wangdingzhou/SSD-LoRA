@@ -45,7 +45,11 @@ def _inference_tile(model, tile, device):
     """Dispatch to correct inference based on decoder type."""
     if hasattr(model, 'decoder') and hasattr(model.decoder, 'predict'):
         return _m2f_inference_tile(model, tile, device)
-    return model(tile)
+    out = model(tile)
+    # SC-CMRD-LAR / multi-output decoders return dict; extract main logits
+    if isinstance(out, dict):
+        return out["logits"]
+    return out
 
 
 def load_model(checkpoint_path, config_path, device):
