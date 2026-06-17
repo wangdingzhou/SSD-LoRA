@@ -379,11 +379,23 @@ def train(cfg):
     warm_start_path = cfg.get("warm_start", None)
     warm_start_cfg = cfg.get("warm_start_config", {}) or {}
     warm_start_load_decoder = bool(warm_start_cfg.get("load_decoder", True))
+    warm_start_prefer_ema = bool(warm_start_cfg.get("prefer_ema", True))
     warm_start_skip_prefixes = tuple(warm_start_cfg.get("skip_prefixes", []))
 
     if warm_start_path and os.path.isfile(warm_start_path):
         ckpt = torch.load(warm_start_path, map_location="cpu", weights_only=False)
-        pretrained_state = ckpt.get("model", ckpt.get("state_dict", ckpt))
+        if isinstance(ckpt, dict) and warm_start_prefer_ema and "ema" in ckpt:
+            pretrained_state = ckpt["ema"]
+            warm_start_source = "ema"
+        elif isinstance(ckpt, dict) and "model" in ckpt:
+            pretrained_state = ckpt["model"]
+            warm_start_source = "model"
+        elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+            pretrained_state = ckpt["state_dict"]
+            warm_start_source = "state_dict"
+        else:
+            pretrained_state = ckpt
+            warm_start_source = "raw"
         model_state = model.state_dict()
 
         # Load strategy (Run A-main):
@@ -409,7 +421,7 @@ def train(cfg):
             if not warm_start_load_decoder and k.startswith("decoder."):
                 skipped_decoder.append(k)
                 continue
-            if not any(k.startswith(p) for p in ALLOWLED_PREFIXES_WITH_DEC):
+            if not any(k.startswith(p) for p in ALLOWED_PREFIXES_WITH_DEC):
                 skipped_other.append(k)
                 continue
             if k in model_state and v.shape == model_state[k].shape:
@@ -419,7 +431,7 @@ def train(cfg):
         model_state.update(matched)
         model.load_state_dict(model_state)
         missing = [k for k in model_state if k not in matched]
-        print(f"Warm-started {len(matched)} keys from {warm_start_path}")
+        print(f"Warm-started {len(matched)} keys from {warm_start_path} ({warm_start_source})")
         print(f"  load_decoder={warm_start_load_decoder}, skip_prefixes={list(warm_start_skip_prefixes)}")
         print(f"  Skipped decoder (load_decoder=false): {len(skipped_decoder)} keys")
         print(f"  Skipped by user (skip_prefixes): {len(skipped_by_user)} keys")
