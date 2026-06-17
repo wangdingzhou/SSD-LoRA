@@ -468,6 +468,403 @@ class SSDLoRAModule(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# High-source spectral gate (FeatureSpectralGate)
+# ---------------------------------------------------------------------------
+#
+# Per Run A-main override (`refine-logs/plans/20260617_run_a_main_tasks4_override.md`):
+#   - Source MUST be x BEFORE LoRA_B compression (full D-dimensional feature),
+#     NOT low-rank r_spe=2/4 FFT of compressed LoRA response maps.
+#   - FFT is computed on the spatial-token 2D grid (B, D, H, W) in fp32.
+#   - Output is a per-sample, per-channel gate (B, D) used to modulate E_spe(x).
+#   - Last MLP layer is zero-init so the gate starts at 0 → does not disturb
+#     R0 init (gamma_spe also starts at 0).
+
+class FeatureSpectralGate(nn.Module):
+    """High-source spectral gate: operates on x BEFORE LoRA_B compression.
+
+    Computes 2D FFT magnitudes on the spatial-token grid, pools into n_bands
+    radial frequency bands per channel, then maps to a per-channel gate via
+    a zero-init MLP.
+
+    Input:  x of shape (B, N, D) where N = n_non_spatial + H*W
+    Output: gate of shape (B, D) — multiply x by gate.unsqueeze(1) before
+            passing to E_spe LoRA path.
+    """
+
+    def __init__(
+        self,
+        d_in: int,
+        n_bands: int = 4,
+        hidden_dim: int = 64,
+    ):
+        super().__init__()
+        self.d_in = d_in
+        self.n_bands = n_bands
+
+        # MLP from per-band magnitude stats to per-channel gate.
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(d_in * n_bands, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, d_in),
+        )
+        # Zero-init last layer → gate = 0 at start → E_spe contribution is 0
+        # (also gated by gamma_spe which starts at 0, so double safety).
+        nn.init.zeros_(self.gate_mlp[-1].weight)
+        nn.init.zeros_(self.gate_mlp[-1].bias)
+
+    def _radial_band_masks(self, H: int, W: int, device: torch.device) -> List[torch.Tensor]:
+        """Return n_bands boolean masks of shape (H, W) splitting the FFT
+        magnitude grid into concentric radial frequency bands (low → high).
+        """
+        cy = (H - 1) / 2.0
+        cx = (W - 1) / 2.0
+        ys = torch.arange(H, device=device, dtype=torch.float32).view(H, 1).expand(H, W)
+        xs = torch.arange(W, device=device, dtype=torch.float32).view(1, W).expand(H, W)
+        r = torch.sqrt((ys - cy) ** 2 + (xs - cx) ** 2)
+        r_max = r.max().clamp(min=1.0)
+        r_norm = r / r_max
+        # Band edges: [0, 1/n, 2/n, ..., 1]
+        edges = torch.linspace(0.0, 1.0, self.n_bands + 1, device=device)
+        masks = [(r_norm >= edges[i]) & (r_norm < edges[i + 1]) for i in range(self.n_bands)]
+        # Last band is inclusive on the right edge so we don't lose the corner pixel.
+        masks[-1] = masks[-1] | (r_norm == edges[-1])
+        return masks
+
+    def forward(self, x: torch.Tensor, n_non_spatial: int) -> torch.Tensor:
+        """x: (B, N, D) -> gate: (B, D)."""
+        B, N, D = x.shape
+        spatial = x[:, n_non_spatial:]  # (B, H*W, D)
+        N_spatial = spatial.shape[1]
+        side = int(math.sqrt(N_spatial))
+        if side * side != N_spatial:
+            raise ValueError(
+                f"FeatureSpectralGate requires square spatial grid, "
+                f"got N_spatial={N_spatial}"
+            )
+
+        spatial_2d = spatial.reshape(B, side, side, D).permute(0, 3, 1, 2)  # (B, D, H, W)
+
+        # FFT in fp32 for numerical stability under AMP.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x_fp32 = spatial_2d.float()
+            # 2D FFT, shift origin to center for radial banding.
+            freq = torch.fft.fftshift(torch.fft.fft2(x_fp32), dim=(-2, -1))
+            mag = freq.abs()  # (B, D, H, W)
+
+            masks = self._radial_band_masks(side, side, x.device)
+            band_stats = []
+            for mask in masks:
+                # Per-channel mean magnitude within this band.
+                mask_b = mask.view(1, 1, side, side).expand(B, D, -1, -1)
+                band_mag = (mag * mask_b.float()).sum(dim=(-2, -1)) / mask_b.float().sum(dim=(-2, -1)).clamp(min=1.0)
+                # log1p compresses dynamic range.
+                band_stats.append(torch.log1p(band_mag.clamp(min=0)))  # (B, D)
+
+        band_concat = torch.cat(band_stats, dim=-1)  # (B, D * n_bands)
+        gate = self.gate_mlp(band_concat)  # (B, D)
+        return gate
+
+
+# ---------------------------------------------------------------------------
+# Expert router (2*sigmoid, NOT softmax)
+# ---------------------------------------------------------------------------
+#
+# Per Run A-main override §"Router":
+#   - Independent residual scales s_* = 2 * sigmoid(router_logits_*)
+#   - NOT softmax — experts do NOT compete for fixed probability mass.
+#   - Last layer zero-init → logits=0 → s_* = 2*sigmoid(0) = 1.0 at start.
+#   - At init, output ≡ R0 SSD-LoRA with TCAM (sem + spa + tex combined).
+#   - Output shape: (B, n_experts) where n_experts is 3 (sem/spa/tex) or 4
+#     (with high-source spectral).
+
+class ExpertRouter(nn.Module):
+    """Per-sample independent expert scale router (NOT softmax)."""
+
+    def __init__(
+        self,
+        d_in: int,
+        n_experts: int = 3,
+        hidden_dim: int = 64,
+    ):
+        super().__init__()
+        self.d_in = d_in
+        self.n_experts = n_experts
+
+        self.pool_proj = nn.Linear(d_in, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, n_experts)
+        # Zero-init out_proj → logits = 0 → scales = 2*sigmoid(0) = 1.0.
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x: torch.Tensor, n_non_spatial: int) -> torch.Tensor:
+        """x: (B, N, D) -> scales: (B, n_experts), all init to 1.0."""
+        B, N, D = x.shape
+        # Pool spatial tokens only; CLS/storage tokens carry no spatial structure.
+        spatial = x[:, n_non_spatial:]  # (B, N_spatial, D)
+        pooled = spatial.mean(dim=1)  # (B, D)
+        h = torch.relu(self.pool_proj(pooled))  # (B, hidden_dim)
+        logits = self.out_proj(h)  # (B, n_experts)
+        scales = 2.0 * torch.sigmoid(logits)  # (B, n_experts), init=1.0
+        return scales
+
+
+# ---------------------------------------------------------------------------
+# Routed SF-SSD-LoRA Module (Run A-main, 4-expert per override)
+# ---------------------------------------------------------------------------
+#
+# Per Run A-main override §"Architecture":
+#
+#   y = frozen_linear(x)
+#     + s_sem     * alpha_sem * E_sem(x)
+#     + s_spa     * alpha_str * E_spa(x)
+#     + s_tex     * alpha_str * (E_tex(x) - E_spa(x))
+#     + gamma_spe * s_spe     * E_spe_high_source(x)
+#
+# Where:
+#   E_sem:  standard semantic LoRA, x -> lora_sem_B -> lora_sem_A
+#   E_spa:  structural WITHOUT TCAM, x -> lora_str_B -> spatial_conv -> lora_str_A
+#   E_tex:  structural WITH TCAM,    x -> lora_str_B -> spatial_conv -> TCAM -> lora_str_A
+#   (E_tex - E_spa): texture marginal — isolates TCAM contribution so router
+#                    can scale it without disturbing the R0 structural base.
+#   E_spe_high_source: optional; source from x BEFORE LoRA_B compression via
+#                      FeatureSpectralGate. NOT r_spe=2/4 low-rank FFT.
+#
+# Init (router zero-init + gamma_spe=0): output ≡ R0 SSD-LoRA with TCAM.
+
+class RoutedSSDLoRAModule(nn.Module):
+    """Routed SF-SSD-LoRA: 4-expert per-sample gated SSD-LoRA (Run A-main)."""
+
+    def __init__(
+        self,
+        frozen_linear: nn.Linear,
+        r_sem: int,
+        r_str: int,
+        n_non_spatial: int = 5,
+        structural_path_type: str = "single",
+        use_rslora: bool = False,
+        tcam_type: Optional[str] = None,
+        tcam_gamma: float = 0.2,
+        tcam_hidden_min: int = 8,
+        spectral_enabled: bool = False,
+        r_spe: int = 0,
+        spectral_n_bands: int = 4,
+        spectral_hidden_dim: int = 64,
+        router_hidden_dim: int = 64,
+    ):
+        super().__init__()
+        self.frozen_linear = frozen_linear
+        self.r_sem = r_sem
+        self.r_str = r_str
+        self.n_non_spatial = n_non_spatial
+        self.lora_mode = "routed_sf_ssd"
+        self.use_rslora = use_rslora
+        self.tcam_type = tcam_type
+        self.tcam_gamma = tcam_gamma
+        self.tcam_hidden_min = tcam_hidden_min
+
+        self._rslora_scale_sem = 1.0 / math.sqrt(r_sem) if (use_rslora and r_sem > 0) else 1.0
+        self._rslora_scale_str = 1.0 / math.sqrt(r_str) if (use_rslora and r_str > 0) else 1.0
+        self._rslora_scale_spe = 1.0 / math.sqrt(r_spe) if (use_rslora and r_spe > 0) else 1.0
+
+        d_in = frozen_linear.in_features
+        d_out = frozen_linear.out_features
+        self.in_features = d_in
+        self.out_features = d_out
+
+        # Freeze original weights
+        self.frozen_linear.weight.requires_grad_(False)
+        if self.frozen_linear.bias is not None:
+            self.frozen_linear.bias.requires_grad_(False)
+
+        # --- Semantic expert (E_sem) ---
+        if r_sem > 0:
+            self.lora_sem_A = nn.Parameter(torch.empty(d_out, r_sem))
+            self.lora_sem_B = nn.Parameter(torch.zeros(r_sem, d_in))
+            nn.init.kaiming_uniform_(self.lora_sem_A, a=math.sqrt(5))
+            self.alpha_sem = nn.Parameter(torch.ones(1))
+
+        # --- Spatial + Texture experts (shared str params; TCAM only for tex) ---
+        if r_str > 0:
+            self.lora_str_A = nn.Parameter(torch.empty(d_out, r_str))
+            self.lora_str_B = nn.Parameter(torch.zeros(r_str, d_in))
+            nn.init.kaiming_uniform_(self.lora_str_A, a=math.sqrt(5))
+            self.alpha_str = nn.Parameter(torch.ones(1))
+
+            # Shared spatial_conv between E_spa and E_tex paths.
+            if structural_path_type == "multi_scale_dwconv":
+                self.spatial_conv = MultiScaleDWConv(r_str, dilations=(1, 2, 3))
+            else:
+                self.spatial_conv = nn.Sequential(
+                    nn.Conv2d(r_str, r_str, 3, padding=1, groups=r_str, bias=False),
+                    nn.Conv2d(r_str, r_str, 1, bias=False),
+                )
+
+            # TCAM is REQUIRED in routed mode — the tex expert is the TCAM marginal.
+            if tcam_type is None:
+                raise ValueError(
+                    "RoutedSSDLoRAModule requires tcam_type; the tex expert is "
+                    "the TCAM marginal (E_tex - E_spa). Without TCAM, tex=0."
+                )
+            if tcam_type.endswith("_ln"):
+                raise NotImplementedError(
+                    f"TCAM variant '{tcam_type}' is reserved for later, "
+                    f"not implemented in this round"
+                )
+            if tcam_type.endswith("_nomlp"):
+                use_mlp_flag = False
+                base = tcam_type[:-len("_nomlp")]
+            else:
+                use_mlp_flag = True
+                base = tcam_type
+            if base == "tcam_cov":
+                cov_or_gram = "cov"
+            elif base == "tcam_gram":
+                cov_or_gram = "gram"
+            else:
+                raise ValueError(f"Unknown tcam_type base: {base}")
+            self.tcam = TCAM(
+                r_str,
+                tcam_type=cov_or_gram,
+                use_mlp=use_mlp_flag,
+                gamma=tcam_gamma,
+                hidden_min=tcam_hidden_min,
+            )
+
+        # --- High-source spectral expert (E_spe, optional) ---
+        self.spectral_enabled = spectral_enabled
+        if spectral_enabled:
+            if r_spe <= 0:
+                raise ValueError("spectral_enabled requires r_spe > 0")
+            # Separate A/B from sem/str — high-source rank on full D.
+            self.lora_spe_A = nn.Parameter(torch.empty(d_out, r_spe))
+            self.lora_spe_B = nn.Parameter(torch.zeros(r_spe, d_in))
+            nn.init.kaiming_uniform_(self.lora_spe_A, a=math.sqrt(5))
+            # FeatureSpectralGate sources from x BEFORE LoRA_B compression.
+            self.feat_spectral_gate = FeatureSpectralGate(
+                d_in=d_in,
+                n_bands=spectral_n_bands,
+                hidden_dim=spectral_hidden_dim,
+            )
+            # gamma_spe is a learnable scalar starting at 0.
+            self.gamma_spe = nn.Parameter(torch.zeros(1))
+
+        # --- Router (3 experts without spectral, 4 with) ---
+        n_experts = 4 if spectral_enabled else 3
+        self.router = ExpertRouter(
+            d_in=d_in,
+            n_experts=n_experts,
+            hidden_dim=router_hidden_dim,
+        )
+
+    # ---- spatial helpers (mirror SSDLoRAModule, but both versions accessible) ----
+
+    def _apply_spatial_conv(self, x: torch.Tensor) -> torch.Tensor:
+        """Spatial_conv WITHOUT TCAM. Used for E_spa path."""
+        B, N, r = x.shape
+        n_ns = self.n_non_spatial
+        non_spatial = x[:, :n_ns]
+        spatial = x[:, n_ns:]
+        h = w = int(math.sqrt(spatial.shape[1]))
+        spatial = spatial.reshape(B, h, w, r).permute(0, 3, 1, 2)
+        spatial = self.spatial_conv(spatial)
+        spatial = spatial.permute(0, 2, 3, 1).reshape(B, h * w, r)
+        return torch.cat([non_spatial, spatial], dim=1)
+
+    def _apply_spatial_conv_with_tcam(self, x: torch.Tensor) -> torch.Tensor:
+        """Spatial_conv WITH TCAM. Used for E_tex path."""
+        B, N, r = x.shape
+        n_ns = self.n_non_spatial
+        non_spatial = x[:, :n_ns]
+        spatial = x[:, n_ns:]
+        N_spatial = spatial.shape[1]
+        side = int(math.sqrt(N_spatial))
+        spatial_2d = spatial.reshape(B, side, side, r).permute(0, 3, 1, 2)
+        spatial_2d = self.spatial_conv(spatial_2d)
+        if self.tcam is not None:
+            scale = self.tcam(spatial_2d)  # (B, r, 1, 1)
+            spatial_2d = spatial_2d * scale
+        spatial_out = spatial_2d.permute(0, 2, 3, 1).reshape(B, N_spatial, r)
+        return torch.cat([non_spatial, spatial_out], dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, D = x.shape
+        result = self.frozen_linear(x)
+
+        # Per-sample router scales (B, n_experts), all init to 1.0.
+        scales = self.router(x, self.n_non_spatial)
+        if self.spectral_enabled:
+            s_sem = scales[:, 0]
+            s_spa = scales[:, 1]
+            s_tex = scales[:, 2]
+            s_spe = scales[:, 3]
+        else:
+            s_sem = scales[:, 0]
+            s_spa = scales[:, 1]
+            s_tex = scales[:, 2]
+            s_spe = None
+
+        # --- E_sem ---
+        if self.r_sem > 0:
+            sem = (x @ self.lora_sem_B.T) @ self.lora_sem_A.T
+            s_sem_b = s_sem.view(B, 1, 1)
+            result = result + s_sem_b * (self.alpha_sem * self._rslora_scale_sem) * sem
+
+        # --- E_spa + (E_tex - E_spa) marginal ---
+        # Both paths share lora_str_B, spatial_conv, lora_str_A. Only TCAM differs.
+        # We compute spatial_conv ONCE on B_out, then derive spa_pre (no TCAM)
+        # and tex_pre (with TCAM modulation) from the same spatial_conv output.
+        # Then combine with per-sample scales and do a single A projection.
+        if self.r_str > 0:
+            B_out = x @ self.lora_str_B.T  # (B, N, r_str)
+
+            # Project to 2D for spatial_conv. Keep non-spatial tokens aside.
+            B_cur, N_cur, r_cur = B_out.shape
+            n_ns = self.n_non_spatial
+            non_spatial_b = B_out[:, :n_ns]
+            spatial_b = B_out[:, n_ns:]
+            N_spatial = spatial_b.shape[1]
+            side = int(math.sqrt(N_spatial))
+            spatial_2d = spatial_b.reshape(B_cur, side, side, r_cur).permute(0, 3, 1, 2)
+
+            # spatial_conv (shared): produces the structural-only activation.
+            spa_2d = self.spatial_conv(spatial_2d)  # (B, r, H, W)
+
+            # TCAM modulation produces the tex variant.
+            if self.tcam is not None:
+                scale = self.tcam(spa_2d)  # (B, r, 1, 1)
+                tex_2d = spa_2d * scale
+            else:
+                tex_2d = spa_2d  # no TCAM → tex == spa, marginal is 0
+
+            # Reshape back to token form.
+            spa_pre = spa_2d.permute(0, 2, 3, 1).reshape(B_cur, N_spatial, r_cur)
+            tex_pre = tex_2d.permute(0, 2, 3, 1).reshape(B_cur, N_spatial, r_cur)
+            spa_pre = torch.cat([non_spatial_b, spa_pre], dim=1)  # (B, N, r)
+            tex_pre = torch.cat([non_spatial_b, tex_pre], dim=1)
+
+            s_spa_b = s_spa.view(B, 1, 1)
+            s_tex_b = s_tex.view(B, 1, 1)
+            # combined = s_spa * spa_pre + s_tex * (tex_pre - spa_pre)
+            combined = s_spa_b * spa_pre + s_tex_b * (tex_pre - spa_pre)
+
+            structural = combined @ self.lora_str_A.T  # (B, N, d_out)
+            result = result + (self.alpha_str * self._rslora_scale_str) * structural
+
+        # --- E_spe (high-source spectral, optional) ---
+        # Always compute spe when spectral_enabled so gradient can flow back to
+        # gamma_spe even when gamma_spe=0 at init (d_loss/d_gamma_spe = spe).
+        # gamma_spe=0 means contribution is 0 at init, but the path must run.
+        if self.spectral_enabled:
+            gate = self.feat_spectral_gate(x, self.n_non_spatial)  # (B, D)
+            gated_x = x * gate.unsqueeze(1)  # (B, N, D)
+            spe = (gated_x @ self.lora_spe_B.T) @ self.lora_spe_A.T  # (B, N, d_out)
+            s_spe_b = s_spe.view(B, 1, 1)
+            result = result + self.gamma_spe * s_spe_b * self._rslora_scale_spe * spe
+
+        return result
+
+
+# ---------------------------------------------------------------------------
 # Feature Fusion
 # ---------------------------------------------------------------------------
 
@@ -635,7 +1032,7 @@ class HALoRASeg(nn.Module):
         alpha_init = lora_cfg.get("alpha_init", 1.0)
         use_rslora = lora_cfg.get("use_rslora", False)
 
-        # TCAM config (new in Phase 3b-S)
+        # TCAM config (Phase 3b-S)
         # If structural_path_type starts with "tcam_", enter TCAM mode.
         # tcam_base_path controls non-TCAM blocks (must be single/multi_scale_dwconv).
         # tcam_blocks (1-indexed in config) restricts TCAM to a subset.
@@ -668,7 +1065,32 @@ class HALoRASeg(nn.Module):
         else:
             tcam_blocks_0idx = None  # means all blocks (only meaningful if tcam_type set)
 
+        # --- Run A-main: Routed SF-SSD-LoRA (override 2026-06-17) ---
+        # When mode == "routed_sf_ssd", we wrap each linear in RoutedSSDLoRAModule
+        # instead of SSDLoRAModule. Routed requires TCAM (tex expert = TCAM marginal).
+        # Spectral is optional (spectral_cfg.enabled); defaults off in Run A-main.
+        is_routed = (lora_mode == "routed_sf_ssd")
+        spectral_cfg = lora_cfg.get("spectral", {}) or {}
+        spectral_enabled = bool(spectral_cfg.get("enabled", False))
+        r_spe = int(spectral_cfg.get("r_spe", 0)) if spectral_enabled else 0
+        spectral_n_bands = int(spectral_cfg.get("n_bands", 4))
+        spectral_hidden_dim = int(spectral_cfg.get("hidden_dim", 64))
+        router_hidden_dim = int(lora_cfg.get("router_hidden_dim", 64))
+
+        if is_routed:
+            # Routed mode REQUIRES TCAM (tex expert = E_tex - E_spa marginal).
+            if tcam_type is None:
+                raise ValueError(
+                    "lora.mode='routed_sf_ssd' requires structural_path_type to start "
+                    "with 'tcam_' — the tex expert is the TCAM marginal."
+                )
+            if spectral_enabled and r_spe <= 0:
+                raise ValueError(
+                    "spectral.enabled=true requires spectral.r_spe > 0 (high-source rank)."
+                )
+
         n_tcam_modules = 0
+        n_routed_modules = 0
         for i, block in enumerate(self.backbone.blocks):
             r_sem, r_str = self._get_rank_for_block(i)
             if r_sem == 0 and r_str == 0:
@@ -682,19 +1104,47 @@ class HALoRASeg(nn.Module):
             else:
                 block_tcam_type = None
 
-            common_kwargs = dict(
-                r_sem=r_sem, r_str=r_str, n_non_spatial=n_non_spatial,
-                lora_mode=lora_mode, structural_path_type=base_structural_path,
-                use_rslora=use_rslora, tcam_type=block_tcam_type,
-                tcam_gamma=tcam_gamma, tcam_hidden_min=tcam_hidden_min,
-            )
+            if is_routed:
+                # In routed mode, only route blocks that have TCAM enabled.
+                # Other blocks (e.g. tcam_blocks outside the selected range)
+                # fall back to vanilla SSD-LoRA to preserve R0 base behavior.
+                if block_tcam_type is None:
+                    common_kwargs = dict(
+                        r_sem=r_sem, r_str=r_str, n_non_spatial=n_non_spatial,
+                        lora_mode="ssd", structural_path_type=base_structural_path,
+                        use_rslora=use_rslora, tcam_type=None,
+                        tcam_gamma=tcam_gamma, tcam_hidden_min=tcam_hidden_min,
+                    )
+                    ModuleCls = SSDLoRAModule
+                else:
+                    common_kwargs = dict(
+                        r_sem=r_sem, r_str=r_str, n_non_spatial=n_non_spatial,
+                        structural_path_type=base_structural_path,
+                        use_rslora=use_rslora, tcam_type=block_tcam_type,
+                        tcam_gamma=tcam_gamma, tcam_hidden_min=tcam_hidden_min,
+                        spectral_enabled=spectral_enabled,
+                        r_spe=r_spe,
+                        spectral_n_bands=spectral_n_bands,
+                        spectral_hidden_dim=spectral_hidden_dim,
+                        router_hidden_dim=router_hidden_dim,
+                    )
+                    ModuleCls = RoutedSSDLoRAModule
+                    n_routed_modules += 1
+            else:
+                common_kwargs = dict(
+                    r_sem=r_sem, r_str=r_str, n_non_spatial=n_non_spatial,
+                    lora_mode=lora_mode, structural_path_type=base_structural_path,
+                    use_rslora=use_rslora, tcam_type=block_tcam_type,
+                    tcam_gamma=tcam_gamma, tcam_hidden_min=tcam_hidden_min,
+                )
+                ModuleCls = SSDLoRAModule
 
             if "qkv" in target_modules:
-                block.attn.qkv = SSDLoRAModule(block.attn.qkv, **common_kwargs)
+                block.attn.qkv = ModuleCls(block.attn.qkv, **common_kwargs)
             if "fc1" in target_modules:
-                block.mlp.fc1 = SSDLoRAModule(block.mlp.fc1, **common_kwargs)
+                block.mlp.fc1 = ModuleCls(block.mlp.fc1, **common_kwargs)
             if "fc2" in target_modules:
-                block.mlp.fc2 = SSDLoRAModule(block.mlp.fc2, **common_kwargs)
+                block.mlp.fc2 = ModuleCls(block.mlp.fc2, **common_kwargs)
 
         # Print TCAM summary for traceability
         if tcam_type is not None:
@@ -712,6 +1162,16 @@ class HALoRASeg(nn.Module):
                 f"({n_tcam_modules} blocks x {len(target_modules)} targets)"
             )
 
+        if is_routed:
+            print(
+                f"Routed SF-SSD-LoRA: routed_modules={n_routed_modules*len(target_modules)} "
+                f"({n_routed_modules} blocks x {len(target_modules)} targets), "
+                f"n_experts_per_module={'4 (sem/spa/tex/spe)' if spectral_enabled else '3 (sem/spa/tex)'}, "
+                f"router_hidden_dim={router_hidden_dim}, "
+                f"spectral_enabled={spectral_enabled}"
+                + (f", r_spe={r_spe}, n_bands={spectral_n_bands}" if spectral_enabled else "")
+            )
+
         # Initialize alpha values if specified
         if alpha_init != 1.0:
             for block in self.backbone.blocks:
@@ -721,6 +1181,11 @@ class HALoRASeg(nn.Module):
                     for m in module:
                         mod = getattr(mod, m)
                     if isinstance(mod, SSDLoRAModule):
+                        if mod.r_sem > 0:
+                            mod.alpha_sem.data.fill_(alpha_init)
+                        if mod.r_str > 0:
+                            mod.alpha_str.data.fill_(alpha_init)
+                    elif isinstance(mod, RoutedSSDLoRAModule):
                         if mod.r_sem > 0:
                             mod.alpha_sem.data.fill_(alpha_init)
                         if mod.r_str > 0:

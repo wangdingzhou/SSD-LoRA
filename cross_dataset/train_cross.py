@@ -207,37 +207,141 @@ def _m2f_predict(model, images):
     return model.decoder.predict(feature_maps, img_size=(H, W))
 
 
-def build_optimizer_with_groups(model, lr_groups_cfg, weight_decay):
-    """Build AdamW with 4 LR groups for SCHRR v2.
+def collect_routed_diagnostics(model):
+    """Run A-main: collect per-iter diagnostics for RoutedSSDLoRAModule instances.
 
-    Groups: decoder_new, hr_encoder, router_gate_lar (all 1.5e-4),
-            lora_tcam (3.0e-5). Backbone base frozen (excluded by requires_grad=False).
+    Returns dict with:
+      - routed_n_modules: count of routed modules in model
+      - router_s_<name>_mean: mean scale per expert (sem/spa/tex[/spe])
+      - router_s_<name>_std:  std of scale across samples and modules
+      - router_entropy_mean:  mean entropy of router logits across modules
+                              (using softmax over the n_expert logits to get a
+                              comparable "which-expert-dominates" signal even
+                              though the model uses 2*sigmoid, not softmax)
+      - gamma_spe_mean:       mean gamma_spe across modules (0 if no spectral)
+
+    Returns empty dict if model has no routed modules.
     """
-    PEFT_KEYWORDS = ("lora_", "alpha_sem", "alpha_str", "spatial_conv", "tcam")
-    groups = {"decoder_new": [], "hr_encoder": [], "router_gate_lar": [], "lora_tcam": []}
+    try:
+        from model import RoutedSSDLoRAModule
+    except ImportError:
+        return {}
+
+    routed_modules = []
+    for name, mod in model.named_modules():
+        if isinstance(mod, RoutedSSDLoRAModule):
+            routed_modules.append((name, mod))
+    if not routed_modules:
+        return {}
+
+    diag = {"routed_n_modules": len(routed_modules)}
+
+    # Aggregate router out_proj weights → entropy signal.
+    # We don't run router forward here (no input at this point); instead, inspect
+    # the learned weights to summarize how far the router has moved from init.
+    # init: out_proj.weight = 0, bias = 0.
+    out_norms = []
+    bias_norms = []
+    gamma_spe_vals = []
+    for name, mod in routed_modules:
+        w = mod.router.out_proj.weight.detach()  # (n_experts, hidden_dim)
+        b = mod.router.out_proj.bias.detach()    # (n_experts,)
+        # Per-expert norm (L2 across hidden_dim), then mean → "how much this expert's
+        # router weights have grown from zero init".
+        per_expert_norm = w.norm(dim=1)  # (n_experts,)
+        out_norms.append(per_expert_norm)
+        bias_norms.append(b)
+        if mod.spectral_enabled and hasattr(mod, "gamma_spe"):
+            gamma_spe_vals.append(mod.gamma_spe.detach().item())
+
+    if out_norms:
+        stacked = torch.stack(out_norms)  # (n_modules, n_experts)
+        diag["router_w_norm_mean"] = stacked.mean().item()
+        diag["router_w_norm_std"] = stacked.std().item()
+        per_expert = stacked.mean(dim=0)  # (n_experts,)
+        expert_names = ["sem", "spa", "tex"]
+        if routed_modules[0][1].spectral_enabled:
+            expert_names.append("spe")
+        for i, ename in enumerate(expert_names):
+            diag[f"router_w_{ename}_mean"] = per_expert[i].item()
+
+    if bias_norms:
+        bias_stacked = torch.stack(bias_norms)  # (n_modules, n_experts)
+        diag["router_bias_norm_mean"] = bias_stacked.norm(dim=1).mean().item()
+
+    if gamma_spe_vals:
+        diag["gamma_spe_mean"] = sum(gamma_spe_vals) / len(gamma_spe_vals)
+
+    return diag
+
+
+def build_optimizer_with_groups(model, lr_groups_cfg, weight_decay):
+    """Build AdamW with Run A-main 4-group LR (override 2026-06-17).
+
+    Groups (per override §"Optimizer Groups"):
+      - decoder_r0: existing MLPDecoder params (lr from cfg)
+      - lora_core:  existing SSD-LoRA params — lora_sem_*/lora_str_*, alpha_sem,
+                    alpha_str, spatial_conv, tcam (lr from cfg)
+      - router_gate: new router params (router.*, gamma_spe) (lr from cfg)
+      - expert_new:  new high-source spectral params (lora_spe_*, feat_spectral_gate)
+                     (lr from cfg). Empty if spectral disabled.
+
+    Backbone base params are excluded by requires_grad=False before this call.
+    """
+    LORA_CORE_KEYWORDS = (
+        "lora_sem_", "lora_str_",
+        "alpha_sem", "alpha_str",
+        "spatial_conv", "tcam",
+    )
+    EXPERT_NEW_KEYWORDS = (
+        "lora_spe_", "feat_spectral_gate", "gamma_spe",
+    )
+    ROUTER_KEYWORDS = ("router.",)
+
+    groups = {
+        "decoder_r0": [],
+        "lora_core": [],
+        "router_gate": [],
+        "expert_new": [],
+    }
     for name, param in model.named_parameters():
         if not param.requires_grad:
-            continue  # backbone base frozen
-        if any(k in name for k in PEFT_KEYWORDS):
-            groups["lora_tcam"].append(param)
-        elif "hr_encoder" in name:
-            groups["hr_encoder"].append(param)
-        elif any(x in name for x in ["router_conv", "attn_convs", "gate", "coeff_conv", "raw_lambda"]):
-            groups["router_gate_lar"].append(param)
+            continue
+        if any(k in name for k in ROUTER_KEYWORDS):
+            groups["router_gate"].append(param)
+        elif any(k in name for k in EXPERT_NEW_KEYWORDS):
+            groups["expert_new"].append(param)
+        elif any(k in name for k in LORA_CORE_KEYWORDS):
+            groups["lora_core"].append(param)
+        elif name.startswith("decoder."):
+            groups["decoder_r0"].append(param)
         else:
-            # decoder.layer_projs, schrr_8/4 (lar v_proj/q_proj/out_proj + fuse),
-            # refine, head, aux_head_conv
-            groups["decoder_new"].append(param)
+            # Default: treat unknown trainable params as lora_core (safer than
+            # decoder_r0; avoids accidentally freezing new modules out of the
+            # high-LR groups). All currently-known trainable params fall into
+            # one of the explicit branches above.
+            groups["lora_core"].append(param)
 
     param_groups = [
-        {"params": groups["decoder_new"], "lr": lr_groups_cfg["decoder_new"], "weight_decay": weight_decay},
-        {"params": groups["hr_encoder"], "lr": lr_groups_cfg["hr_encoder"], "weight_decay": weight_decay},
-        {"params": groups["router_gate_lar"], "lr": lr_groups_cfg["router_gate_lar"], "weight_decay": weight_decay},
-        {"params": groups["lora_tcam"], "lr": lr_groups_cfg["lora_tcam"], "weight_decay": 0.0},
+        {"params": groups["decoder_r0"], "lr": lr_groups_cfg["decoder_r0"], "weight_decay": weight_decay},
+        {"params": groups["lora_core"], "lr": lr_groups_cfg["lora_core"], "weight_decay": 0.0},
+        {"params": groups["router_gate"], "lr": lr_groups_cfg["router_gate"], "weight_decay": 0.0},
     ]
-    for gname in ["decoder_new", "hr_encoder", "router_gate_lar", "lora_tcam"]:
+    # expert_new is omitted entirely if empty (override: don't create dummy groups).
+    if groups["expert_new"]:
+        if "expert_new" not in lr_groups_cfg:
+            raise ValueError(
+                "expert_new params detected but lr_groups.expert_new not set in config. "
+                "Either add spectral params and set expert_new LR, or disable spectral."
+            )
+        param_groups.append(
+            {"params": groups["expert_new"], "lr": lr_groups_cfg["expert_new"], "weight_decay": 0.0}
+        )
+
+    for gname in ["decoder_r0", "lora_core", "router_gate", "expert_new"]:
         n_params = sum(p.numel() for p in groups[gname])
-        print(f"  LR group {gname}: {len(groups[gname])} tensors, {n_params/1e6:.2f}M params, lr={lr_groups_cfg[gname]}")
+        lr_val = lr_groups_cfg.get(gname, "—")
+        print(f"  LR group {gname}: {len(groups[gname])} tensors, {n_params/1e6:.2f}M params, lr={lr_val}")
     return torch.optim.AdamW(param_groups)
 
 
@@ -267,52 +371,92 @@ def train(cfg):
     model.to(device)
     print(f"Device: {device}")
 
-    # ---- Warm-start from R0 (v2: before optimizer/EMA, after model.to(device)) ----
-    # Loads backbone + LoRA/TCAM from R0 80.95% checkpoint. Decoder from scratch.
+    # ---- Warm-start from R0 (Run A-main: config-driven, before optimizer/EMA) ----
+    # Loads backbone + LoRA/TCAM from R0 80.95% checkpoint. Decoder is loaded
+    # only if cfg.warm_start_load_decoder=true (default false for SCHRR; Run
+    # A-main sets it true because we keep R0 MLPDecoder structure).
     # Must be BEFORE optimizer/EMA creation so EMA shadow = warm-started model.
     warm_start_path = cfg.get("warm_start", None)
+    warm_start_cfg = cfg.get("warm_start_config", {}) or {}
+    warm_start_load_decoder = bool(warm_start_cfg.get("load_decoder", True))
+    warm_start_skip_prefixes = tuple(warm_start_cfg.get("skip_prefixes", []))
+
     if warm_start_path and os.path.isfile(warm_start_path):
         ckpt = torch.load(warm_start_path, map_location="cpu", weights_only=False)
-        pretrained_state = ckpt["model"]
+        pretrained_state = ckpt.get("model", ckpt.get("state_dict", ckpt))
         model_state = model.state_dict()
 
-        # Load strategy: load backbone.* (includes internal LoRA/TCAM).
-        # Skip: decoder.* (old R0 decoder, structurally different).
-        # Train strategy: base DINO frozen, LoRA/TCAM trainable (see freeze below).
+        # Load strategy (Run A-main):
+        #   - Always load backbone.* (DINOv3 + internal SSD-LoRA / TCAM)
+        #   - Load decoder.* ONLY if warm_start_load_decoder=true
+        #     (Run A-main keeps the R0 MLPDecoder fusion/head structure, so
+        #     decoder.* keys should match exactly)
+        #   - Always skip any prefix in warm_start_skip_prefixes (manual override)
         ALLOWED_PREFIXES = ("backbone.",)
-        BLOCKED_PREFIXES = ("decoder.",)
+        if warm_start_load_decoder:
+            ALLOWED_PREFIXES_WITH_DEC = ("backbone.", "decoder.")
+        else:
+            ALLOWED_PREFIXES_WITH_DEC = ("backbone.",)
 
         matched = {}
         skipped_decoder = []
         skipped_other = []
+        skipped_by_user = []
         for k, v in pretrained_state.items():
-            if any(k.startswith(p) for p in BLOCKED_PREFIXES):
+            if warm_start_skip_prefixes and any(k.startswith(p) for p in warm_start_skip_prefixes):
+                skipped_by_user.append(k)
+                continue
+            if not warm_start_load_decoder and k.startswith("decoder."):
                 skipped_decoder.append(k)
                 continue
-            if not any(k.startswith(p) for p in ALLOWED_PREFIXES):
+            if not any(k.startswith(p) for p in ALLOWLED_PREFIXES_WITH_DEC):
                 skipped_other.append(k)
                 continue
             if k in model_state and v.shape == model_state[k].shape:
                 matched[k] = v
             else:
-                skipped_other.append(f"{k} (shape mismatch)")
+                skipped_other.append(f"{k} (shape mismatch or not in model)")
         model_state.update(matched)
         model.load_state_dict(model_state)
         missing = [k for k in model_state if k not in matched]
-        print(f"Warm-started {len(matched)} keys (backbone+LoRA/TCAM) from {warm_start_path}")
-        print(f"  Skipped decoder: {len(skipped_decoder)} keys (old R0 decoder)")
-        print(f"  Skipped other: {len(skipped_other)} keys")
-        print(f"  Missing (new model, random init): {len(missing)} keys (new SCHRR decoder.*)")
+        print(f"Warm-started {len(matched)} keys from {warm_start_path}")
+        print(f"  load_decoder={warm_start_load_decoder}, skip_prefixes={list(warm_start_skip_prefixes)}")
+        print(f"  Skipped decoder (load_decoder=false): {len(skipped_decoder)} keys")
+        print(f"  Skipped by user (skip_prefixes): {len(skipped_by_user)} keys")
+        print(f"  Skipped other (no match / shape mismatch): {len(skipped_other)} keys")
+        print(f"  Missing in new model (random init): {len(missing)} keys")
+        # Show a few missing key categories for debug.
+        if missing:
+            missing_categories = set()
+            for k in missing[:50]:
+                parts = k.split(".")
+                if len(parts) >= 3 and parts[0] == "backbone" and parts[1] == "blocks":
+                    # e.g. backbone.blocks.0.attn.qkv.router.out_proj.weight
+                    missing_categories.add(".".join(parts[:5]))
+                else:
+                    missing_categories.add(".".join(parts[:3]))
+            print(f"  Missing key category samples: {sorted(missing_categories)[:8]}")
     elif warm_start_path:
         print(f"WARNING: warm_start path not found: {warm_start_path}")
 
-    # ---- Backbone base freeze (v2: after warm_start, before optimizer) ----
-    # Freeze base DINO weights, keep LoRA/TCAM trainable.
-    # LoRA/TCAM params are under backbone.blocks.*.{qkv,fc1,fc2}.* with names
-    # containing lora_/alpha_sem/alpha_str/spatial_conv/tcam — must except these.
+    # ---- Backbone base freeze (Run A-main: after warm_start, before optimizer) ----
+    # Freeze base DINO weights, keep all PEFT-style params trainable:
+    #   - lora_sem_*/lora_str_* (LoRA A/B matrices)
+    #   - alpha_sem/alpha_str (LoRA alphas)
+    #   - spatial_conv (SSD-LoRA dwconv/pw)
+    #   - tcam (texture channel attention)
+    #   - router.* (ExpertRouter in RoutedSSDLoRAModule)
+    #   - gamma_spe (high-source spectral gate scalar)
+    #   - lora_spe_*/feat_spectral_gate (high-source spectral, optional)
     lr_groups_cfg = cfg.get("lr_groups", None)
     if lr_groups_cfg:
-        PEFT_KEYWORDS = ("lora_", "alpha_sem", "alpha_str", "spatial_conv", "tcam")
+        PEFT_KEYWORDS = (
+            "lora_sem_", "lora_str_", "lora_spe_",
+            "alpha_sem", "alpha_str",
+            "spatial_conv", "tcam",
+            "router.", "gamma_spe",
+            "feat_spectral_gate",
+        )
         n_frozen = 0
         n_peft_kept = 0
         for name, param in model.named_parameters():
@@ -689,6 +833,21 @@ def train(cfg):
                     if "ent_beta" in step_diag:
                         parts.append(f"Ent[β={step_diag['ent_beta']:.4f},H={step_diag['ent_H']:.3f}]")
                     print(f"  DIAG: " + " ".join(parts))
+
+                # Run A-main: routed SF-SSD-LoRA diagnostics
+                routed_diag = collect_routed_diagnostics(model)
+                if routed_diag:
+                    rparts = [f"n={routed_diag['routed_n_modules']}"]
+                    for ename in ("sem", "spa", "tex", "spe"):
+                        key = f"router_w_{ename}_mean"
+                        if key in routed_diag:
+                            rparts.append(f"{ename}={routed_diag[key]:.3f}")
+                    if "router_w_norm_std" in routed_diag:
+                        rparts.append(f"std={routed_diag['router_w_norm_std']:.3f}")
+                    if "gamma_spe_mean" in routed_diag:
+                        rparts.append(f"γ_spe={routed_diag['gamma_spe_mean']:.4f}")
+                    print(f"  ROUTED: " + " ".join(rparts))
+                    step_diag.update({f"routed_{k}": v for k, v in routed_diag.items()})
 
             # TensorBoard per-step diagnostics (SC-CMRD-LAR only)
             if step_diag and writer is not None:
