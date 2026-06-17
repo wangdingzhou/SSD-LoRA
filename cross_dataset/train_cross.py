@@ -571,42 +571,9 @@ def train(cfg):
                             step_diag[f"aux_ce_{scale_tag}"] = l_aux_ce.item()
                             step_diag[f"aux_dice_{scale_tag}"] = l_aux_dice.item()
 
-                    # Affinity preservation loss (SC-CMRD-LAR)
-                    if (
-                        aux_outputs is not None
-                        and "affinity_model" in aux_outputs
-                        and "affinity_anchor" in aux_outputs
-                    ):
-                        aff_cfg = cfg.get("decoder", {}).get(
-                            "sc_cmrd_lar", {}
-                        ).get("affinity_loss", {})
-                        aff_enabled = aff_cfg.get("enabled", False)
-                        aff_warmup_start = aff_cfg.get("warmup_start_epoch", 5)
-                        aff_warmup_end = aff_cfg.get("warmup_end_epoch", 15)
-                        aff_target_weight = aff_cfg.get("weight", 0.01)
-                        aff_weight = 0.0
-                        l_aff_val = 0.0
-                        if aff_enabled and epoch >= aff_warmup_start:
-                            if epoch < aff_warmup_end:
-                                progress = (epoch - aff_warmup_start) / max(1, aff_warmup_end - aff_warmup_start)
-                                aff_weight = aff_target_weight * progress
-                            else:
-                                aff_weight = aff_target_weight
-                            if aff_weight > 0:
-                                if not hasattr(model, "_affinity_loss_fn"):
-                                    from model import AffinityPreservationLoss
-                                    model._affinity_loss_fn = AffinityPreservationLoss(
-                                        n_anchor_tokens=aff_cfg.get("n_anchor_tokens", 196),
-                                        tau=aff_cfg.get("tau", 0.2),
-                                    )
-                                l_aff = model._affinity_loss_fn(
-                                    aux_outputs["affinity_model"],
-                                    aux_outputs["affinity_anchor"],
-                                )
-                                loss = loss + aff_weight * l_aff
-                                l_aff_val = l_aff.item()
-                        step_diag["aff_w"] = aff_weight
-                        step_diag["aff_l"] = l_aff_val
+                    # NOTE: AffinityPreservationLoss + SCCMRDLarDecoder route removed in
+                    # cleanup (2026-06-17). The block previously here lazy-imported
+                    # AffinityPreservationLoss from src.model which no longer exists.
 
                     # Router entropy regularization (v2: anti-collapse, from step 0)
                     # H = 0.5 * (H8 + H4), loss -= beta * H (maximize entropy)
