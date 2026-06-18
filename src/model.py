@@ -484,11 +484,23 @@ class FeatureSpectralGate(nn.Module):
 
     Computes 2D FFT magnitudes on the spatial-token grid, pools into n_bands
     radial frequency bands per channel, then maps to a per-channel gate via
-    a zero-init MLP.
+    an MLP whose last layer is zero-init by default.
 
     Input:  x of shape (B, N, D) where N = n_non_spatial + H*W
     Output: gate of shape (B, D) — multiply x by gate.unsqueeze(1) before
             passing to E_spe LoRA path.
+
+    Dead-branch avoidance (Run A-main override §"Initialization"):
+      When gamma_spe_init == 0 in the parent RoutedSSDLoRAModule, gate output
+      is forced to 0 (zero_init_gate=True) so spectral forward contribution
+      is exactly 0 at init. WARNING: this configuration is a dead branch —
+      gamma_spe=0 ⇒ dL/d(spe)=0 ⇒ no spectral parameter receives gradient
+      until gamma_spe is manually unfrozen.
+
+      When gamma_spe_init > 0 (e.g., 1e-3, the default), zero_init_gate=False
+      so the last MLP layer is small Kaiming (scaled 0.01). Gate output is
+      small but non-zero, so all spectral params learn from step 0. Forward
+      contribution is bounded by gamma_spe_init (~1e-3 scale).
     """
 
     def __init__(
@@ -496,6 +508,7 @@ class FeatureSpectralGate(nn.Module):
         d_in: int,
         n_bands: int = 4,
         hidden_dim: int = 64,
+        zero_init_gate: bool = True,
     ):
         super().__init__()
         self.d_in = d_in
@@ -507,10 +520,19 @@ class FeatureSpectralGate(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, d_in),
         )
-        # Zero-init last layer → gate = 0 at start → E_spe contribution is 0
-        # (also gated by gamma_spe which starts at 0, so double safety).
-        nn.init.zeros_(self.gate_mlp[-1].weight)
-        nn.init.zeros_(self.gate_mlp[-1].bias)
+        if zero_init_gate:
+            # Silent mode: gate = 0 ⇒ E_spe contribution = 0 at start.
+            # Combined with gamma_spe=0, this is a dead branch (override's
+            # conservative option).
+            nn.init.zeros_(self.gate_mlp[-1].weight)
+            nn.init.zeros_(self.gate_mlp[-1].bias)
+        else:
+            # Active mode: small Kaiming so gate is non-zero at start.
+            # Forward contribution is bounded by parent's gamma_spe_init.
+            nn.init.kaiming_uniform_(self.gate_mlp[-1].weight, a=math.sqrt(5))
+            nn.init.zeros_(self.gate_mlp[-1].bias)
+            with torch.no_grad():
+                self.gate_mlp[-1].weight.mul_(0.01)
 
     def _radial_band_masks(self, H: int, W: int, device: torch.device) -> List[torch.Tensor]:
         """Return n_bands boolean masks of shape (H, W) splitting the FFT
@@ -649,6 +671,7 @@ class RoutedSSDLoRAModule(nn.Module):
         r_spe: int = 0,
         spectral_n_bands: int = 4,
         spectral_hidden_dim: int = 64,
+        gamma_spe_init: float = 1e-3,
         router_hidden_dim: int = 64,
     ):
         super().__init__()
@@ -736,17 +759,38 @@ class RoutedSSDLoRAModule(nn.Module):
             if r_spe <= 0:
                 raise ValueError("spectral_enabled requires r_spe > 0")
             # Separate A/B from sem/str — high-source rank on full D.
+            #
+            # Dead-branch avoidance (override §"Initialization" allows gamma_spe
+            # = 0 OR 1e-3): if all three of (gate_MLP_last_layer, lora_spe_B,
+            # gamma_spe) are zero at init, then spe = 0 AND d(loss)/d(spe)=0 AND
+            # all upstream gradients are 0 → spectral params never learn.
+            #
+            # When spectral is enabled, we init gamma_spe > 0 (default 1e-3) AND
+            # break the zero-init on the gate MLP last layer AND on lora_spe_B.
+            # This produces a small but non-zero spe at init (~1e-3 scale on
+            # spectral contribution), so sem/spa/tex stay ≈ R0 while spectral
+            # learns from step 0. R0 drift is bounded by gamma_spe_init.
             self.lora_spe_A = nn.Parameter(torch.empty(d_out, r_spe))
-            self.lora_spe_B = nn.Parameter(torch.zeros(r_spe, d_in))
+            self.lora_spe_B = nn.Parameter(torch.empty(r_spe, d_in))
             nn.init.kaiming_uniform_(self.lora_spe_A, a=math.sqrt(5))
+            if gamma_spe_init > 0:
+                # Non-zero B init: small Kaiming so spe has a non-zero path at init.
+                nn.init.kaiming_uniform_(self.lora_spe_B, a=math.sqrt(5))
+                # Scale down so contribution stays small (gamma_spe_init controls overall).
+                with torch.no_grad():
+                    self.lora_spe_B.mul_(0.01)
+            else:
+                # gamma_spe_init == 0: keep B at zero (standard LoRA). WARNING:
+                # this leaves the spectral branch dead until manually unfrozen.
+                nn.init.zeros_(self.lora_spe_B)
             # FeatureSpectralGate sources from x BEFORE LoRA_B compression.
             self.feat_spectral_gate = FeatureSpectralGate(
                 d_in=d_in,
                 n_bands=spectral_n_bands,
                 hidden_dim=spectral_hidden_dim,
+                zero_init_gate=(gamma_spe_init == 0),  # see note in FeatureSpectralGate
             )
-            # gamma_spe is a learnable scalar starting at 0.
-            self.gamma_spe = nn.Parameter(torch.zeros(1))
+            self.gamma_spe = nn.Parameter(torch.tensor([gamma_spe_init]))
 
         # --- Router (3 experts without spectral, 4 with) ---
         n_experts = 4 if spectral_enabled else 3
@@ -1075,6 +1119,7 @@ class HALoRASeg(nn.Module):
         r_spe = int(spectral_cfg.get("r_spe", 0)) if spectral_enabled else 0
         spectral_n_bands = int(spectral_cfg.get("n_bands", 4))
         spectral_hidden_dim = int(spectral_cfg.get("hidden_dim", 64))
+        gamma_spe_init = float(spectral_cfg.get("gamma_spe_init", 1e-3))
         router_hidden_dim = int(lora_cfg.get("router_hidden_dim", 64))
 
         if is_routed:
@@ -1126,6 +1171,7 @@ class HALoRASeg(nn.Module):
                         r_spe=r_spe,
                         spectral_n_bands=spectral_n_bands,
                         spectral_hidden_dim=spectral_hidden_dim,
+                        gamma_spe_init=gamma_spe_init,
                         router_hidden_dim=router_hidden_dim,
                     )
                     ModuleCls = RoutedSSDLoRAModule
