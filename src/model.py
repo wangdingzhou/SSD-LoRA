@@ -722,36 +722,36 @@ class RoutedSSDLoRAModule(nn.Module):
                     nn.Conv2d(r_str, r_str, 1, bias=False),
                 )
 
-            # TCAM is REQUIRED in routed mode — the tex expert is the TCAM marginal.
+            # TCAM is OPTIONAL in routed mode.
+            # - With TCAM (shallow blocks): tex expert = E_tex - E_spa marginal
+            # - Without TCAM (deep blocks): no tex expert; sem/spa/(spe) only
             if tcam_type is None:
-                raise ValueError(
-                    "RoutedSSDLoRAModule requires tcam_type; the tex expert is "
-                    "the TCAM marginal (E_tex - E_spa). Without TCAM, tex=0."
-                )
-            if tcam_type.endswith("_ln"):
-                raise NotImplementedError(
-                    f"TCAM variant '{tcam_type}' is reserved for later, "
-                    f"not implemented in this round"
-                )
-            if tcam_type.endswith("_nomlp"):
-                use_mlp_flag = False
-                base = tcam_type[:-len("_nomlp")]
+                self.tcam = None
             else:
-                use_mlp_flag = True
-                base = tcam_type
-            if base == "tcam_cov":
-                cov_or_gram = "cov"
-            elif base == "tcam_gram":
-                cov_or_gram = "gram"
-            else:
-                raise ValueError(f"Unknown tcam_type base: {base}")
-            self.tcam = TCAM(
-                r_str,
-                tcam_type=cov_or_gram,
-                use_mlp=use_mlp_flag,
-                gamma=tcam_gamma,
-                hidden_min=tcam_hidden_min,
-            )
+                if tcam_type.endswith("_ln"):
+                    raise NotImplementedError(
+                        f"TCAM variant '{tcam_type}' is reserved for later, "
+                        f"not implemented in this round"
+                    )
+                if tcam_type.endswith("_nomlp"):
+                    use_mlp_flag = False
+                    base = tcam_type[:-len("_nomlp")]
+                else:
+                    use_mlp_flag = True
+                    base = tcam_type
+                if base == "tcam_cov":
+                    cov_or_gram = "cov"
+                elif base == "tcam_gram":
+                    cov_or_gram = "gram"
+                else:
+                    raise ValueError(f"Unknown tcam_type base: {base}")
+                self.tcam = TCAM(
+                    r_str,
+                    tcam_type=cov_or_gram,
+                    use_mlp=use_mlp_flag,
+                    gamma=tcam_gamma,
+                    hidden_min=tcam_hidden_min,
+                )
 
         # --- High-source spectral expert (E_spe, optional) ---
         self.spectral_enabled = spectral_enabled
@@ -792,8 +792,15 @@ class RoutedSSDLoRAModule(nn.Module):
             )
             self.gamma_spe = nn.Parameter(torch.tensor([gamma_spe_init]))
 
-        # --- Router (3 experts without spectral, 4 with) ---
-        n_experts = 4 if spectral_enabled else 3
+        # --- Router ---
+        # Expert ordering: [sem, spa] always, +tex if TCAM, +spe if spectral.
+        # n_experts:
+        #   TCAM + spectral: 4 (sem/spa/tex/spe)
+        #   TCAM only:       3 (sem/spa/tex)
+        #   spectral only:   3 (sem/spa/spe)
+        #   neither:         2 (sem/spa)
+        has_tcam = self.tcam is not None
+        n_experts = 2 + (1 if has_tcam else 0) + (1 if spectral_enabled else 0)
         self.router = ExpertRouter(
             d_in=d_in,
             n_experts=n_experts,
@@ -835,16 +842,18 @@ class RoutedSSDLoRAModule(nn.Module):
         result = self.frozen_linear(x)
 
         # Per-sample router scales (B, n_experts), all init to 1.0.
+        # Ordering: [sem, spa] + [tex if tcam] + [spe if spectral].
         scales = self.router(x, self.n_non_spatial)
-        if self.spectral_enabled:
-            s_sem = scales[:, 0]
-            s_spa = scales[:, 1]
-            s_tex = scales[:, 2]
-            s_spe = scales[:, 3]
+        s_sem = scales[:, 0]
+        s_spa = scales[:, 1]
+        idx = 2
+        if self.tcam is not None:
+            s_tex = scales[:, idx]; idx += 1
         else:
-            s_sem = scales[:, 0]
-            s_spa = scales[:, 1]
-            s_tex = scales[:, 2]
+            s_tex = None
+        if self.spectral_enabled:
+            s_spe = scales[:, idx]; idx += 1
+        else:
             s_spe = None
 
         # --- E_sem ---
@@ -873,23 +882,22 @@ class RoutedSSDLoRAModule(nn.Module):
             # spatial_conv (shared): produces the structural-only activation.
             spa_2d = self.spatial_conv(spatial_2d)  # (B, r, H, W)
 
-            # TCAM modulation produces the tex variant.
+            s_spa_b = s_spa.view(B, 1, 1)
             if self.tcam is not None:
+                # tex marginal: spa + s_tex * (tex - spa), tex = spa * TCAM
                 scale = self.tcam(spa_2d)  # (B, r, 1, 1)
                 tex_2d = spa_2d * scale
+                spa_pre = spa_2d.permute(0, 2, 3, 1).reshape(B_cur, N_spatial, r_cur)
+                tex_pre = tex_2d.permute(0, 2, 3, 1).reshape(B_cur, N_spatial, r_cur)
+                spa_pre = torch.cat([non_spatial_b, spa_pre], dim=1)  # (B, N, r)
+                tex_pre = torch.cat([non_spatial_b, tex_pre], dim=1)
+                s_tex_b = s_tex.view(B, 1, 1)
+                combined = s_spa_b * spa_pre + s_tex_b * (tex_pre - spa_pre)
             else:
-                tex_2d = spa_2d  # no TCAM → tex == spa, marginal is 0
-
-            # Reshape back to token form.
-            spa_pre = spa_2d.permute(0, 2, 3, 1).reshape(B_cur, N_spatial, r_cur)
-            tex_pre = tex_2d.permute(0, 2, 3, 1).reshape(B_cur, N_spatial, r_cur)
-            spa_pre = torch.cat([non_spatial_b, spa_pre], dim=1)  # (B, N, r)
-            tex_pre = torch.cat([non_spatial_b, tex_pre], dim=1)
-
-            s_spa_b = s_spa.view(B, 1, 1)
-            s_tex_b = s_tex.view(B, 1, 1)
-            # combined = s_spa * spa_pre + s_tex * (tex_pre - spa_pre)
-            combined = s_spa_b * spa_pre + s_tex_b * (tex_pre - spa_pre)
+                # No tex expert; spa only.
+                spa_pre = spa_2d.permute(0, 2, 3, 1).reshape(B_cur, N_spatial, r_cur)
+                spa_pre = torch.cat([non_spatial_b, spa_pre], dim=1)
+                combined = s_spa_b * spa_pre
 
             structural = combined @ self.lora_str_A.T  # (B, N, d_out)
             result = result + (self.alpha_str * self._rslora_scale_str) * structural
@@ -1123,19 +1131,58 @@ class HALoRASeg(nn.Module):
         router_hidden_dim = int(lora_cfg.get("router_hidden_dim", 64))
 
         if is_routed:
-            # Routed mode REQUIRES TCAM (tex expert = E_tex - E_spa marginal).
-            if tcam_type is None:
+            # Routed mode routes between {sem, spa, [tex if TCAM], [spe if spectral]}.
+            # At least one of TCAM or spectral must be configured.
+            if tcam_type is None and not spectral_enabled:
                 raise ValueError(
-                    "lora.mode='routed_sf_ssd' requires structural_path_type to start "
-                    "with 'tcam_' — the tex expert is the TCAM marginal."
+                    "lora.mode='routed_sf_ssd' requires either "
+                    "structural_path_type starting with 'tcam_' (tex expert) "
+                    "or spectral.enabled=true (spe expert)."
                 )
             if spectral_enabled and r_spe <= 0:
                 raise ValueError(
                     "spectral.enabled=true requires spectral.r_spe > 0 (high-source rank)."
                 )
 
+        # Parse spectral.ranges — per-block gamma_spe_init for differential amplitude.
+        # Format: list of {blocks: [start, end], gamma_spe_init: float} (1-indexed inclusive).
+        # If omitted while spectral_enabled=true, all routed blocks get spectral
+        # with the global spectral.gamma_spe_init.
+        spectral_ranges = None  # None means "all routed blocks"
+        if spectral_enabled:
+            ranges_cfg = spectral_cfg.get("ranges", None)
+            if ranges_cfg is not None:
+                spectral_ranges = []
+                for rng in ranges_cfg:
+                    blocks_spec = rng["blocks"]
+                    if len(blocks_spec) != 2:
+                        raise ValueError(
+                            f"spectral.ranges[].blocks must be [start, end], got {blocks_spec}"
+                        )
+                    start, end = int(blocks_spec[0]), int(blocks_spec[1])
+                    if not (1 <= start <= end <= self.depth):
+                        raise ValueError(
+                            f"spectral.ranges[].blocks invalid: [{start},{end}] "
+                            f"for depth={self.depth}"
+                        )
+                    gamma = float(rng.get("gamma_spe_init", gamma_spe_init))
+                    spectral_ranges.append((start, end, gamma))
+
+        def _block_spectral_cfg(idx_0: int):
+            """Returns (enabled, gamma_spe_init) for block at 0-indexed idx_0."""
+            if not spectral_enabled:
+                return False, 0.0
+            if spectral_ranges is None:
+                return True, gamma_spe_init
+            idx_1 = idx_0 + 1
+            for start, end, gamma in spectral_ranges:
+                if start <= idx_1 <= end:
+                    return True, gamma
+            return False, 0.0
+
         n_tcam_modules = 0
         n_routed_modules = 0
+        n_spectral_modules = 0
         for i, block in enumerate(self.backbone.blocks):
             r_sem, r_str = self._get_rank_for_block(i)
             if r_sem == 0 and r_str == 0:
@@ -1149,11 +1196,31 @@ class HALoRASeg(nn.Module):
             else:
                 block_tcam_type = None
 
+            # Decide per-block spectral
+            block_spe_enabled, block_gamma_spe = _block_spectral_cfg(i)
+
             if is_routed:
-                # In routed mode, only route blocks that have TCAM enabled.
-                # Other blocks (e.g. tcam_blocks outside the selected range)
-                # fall back to vanilla SSD-LoRA to preserve R0 base behavior.
-                if block_tcam_type is None:
+                # A block is routed if it has TCAM OR spectral enabled.
+                # Otherwise (no TCAM, no spectral) fall back to vanilla SSD-LoRA.
+                is_block_routed = (block_tcam_type is not None) or block_spe_enabled
+                if is_block_routed:
+                    common_kwargs = dict(
+                        r_sem=r_sem, r_str=r_str, n_non_spatial=n_non_spatial,
+                        structural_path_type=base_structural_path,
+                        use_rslora=use_rslora, tcam_type=block_tcam_type,
+                        tcam_gamma=tcam_gamma, tcam_hidden_min=tcam_hidden_min,
+                        spectral_enabled=block_spe_enabled,
+                        r_spe=r_spe if block_spe_enabled else 0,
+                        spectral_n_bands=spectral_n_bands,
+                        spectral_hidden_dim=spectral_hidden_dim,
+                        gamma_spe_init=block_gamma_spe,
+                        router_hidden_dim=router_hidden_dim,
+                    )
+                    ModuleCls = RoutedSSDLoRAModule
+                    n_routed_modules += 1
+                    if block_spe_enabled:
+                        n_spectral_modules += 1
+                else:
                     common_kwargs = dict(
                         r_sem=r_sem, r_str=r_str, n_non_spatial=n_non_spatial,
                         lora_mode="ssd", structural_path_type=base_structural_path,
@@ -1161,21 +1228,6 @@ class HALoRASeg(nn.Module):
                         tcam_gamma=tcam_gamma, tcam_hidden_min=tcam_hidden_min,
                     )
                     ModuleCls = SSDLoRAModule
-                else:
-                    common_kwargs = dict(
-                        r_sem=r_sem, r_str=r_str, n_non_spatial=n_non_spatial,
-                        structural_path_type=base_structural_path,
-                        use_rslora=use_rslora, tcam_type=block_tcam_type,
-                        tcam_gamma=tcam_gamma, tcam_hidden_min=tcam_hidden_min,
-                        spectral_enabled=spectral_enabled,
-                        r_spe=r_spe,
-                        spectral_n_bands=spectral_n_bands,
-                        spectral_hidden_dim=spectral_hidden_dim,
-                        gamma_spe_init=gamma_spe_init,
-                        router_hidden_dim=router_hidden_dim,
-                    )
-                    ModuleCls = RoutedSSDLoRAModule
-                    n_routed_modules += 1
             else:
                 common_kwargs = dict(
                     r_sem=r_sem, r_str=r_str, n_non_spatial=n_non_spatial,
@@ -1209,13 +1261,16 @@ class HALoRASeg(nn.Module):
             )
 
         if is_routed:
+            spe_str = (
+                f", spectral_blocks={n_spectral_modules}/{n_routed_modules}, "
+                f"r_spe={r_spe}, n_bands={spectral_n_bands}"
+                if n_spectral_modules > 0 else ", spectral=off"
+            )
             print(
                 f"Routed SF-SSD-LoRA: routed_modules={n_routed_modules*len(target_modules)} "
                 f"({n_routed_modules} blocks x {len(target_modules)} targets), "
-                f"n_experts_per_module={'4 (sem/spa/tex/spe)' if spectral_enabled else '3 (sem/spa/tex)'}, "
-                f"router_hidden_dim={router_hidden_dim}, "
-                f"spectral_enabled={spectral_enabled}"
-                + (f", r_spe={r_spe}, n_bands={spectral_n_bands}" if spectral_enabled else "")
+                f"router_hidden_dim={router_hidden_dim}"
+                + spe_str
             )
 
         # Initialize alpha values if specified
